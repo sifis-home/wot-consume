@@ -1,0 +1,16 @@
+[package]
+name = "wot-consume"
+version = "0.1.0"
+edition = "2021"
+description = "Web of Things (WoT) Thing consumer"
+license = "MIT"
+repository = "https://github.com/sifis-home/wot-consume"
+keywords = ["wot", "WebofThings"]
+
+[dependencies]
+reqwest = "0.11.11"
+wot-td = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1.20.1", features = ["macros", "rt-multi-thread"] }
+
