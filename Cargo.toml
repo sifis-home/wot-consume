@@ -10,6 +10,7 @@ keywords = ["wot", "WebofThings"]
 [dependencies]
 bitflags = "2.2.1"
 reqwest = "0.11.11"
+serde = { version = "1.0.163", features = ["derive"] }
 serde_json = "1.0.96"
 wot-td = "0.3.1"
 

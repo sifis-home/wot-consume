@@ -2,7 +2,10 @@
 //!
 //! Provides all the building blocks to consume (use) [Web Of Things](https://www.w3.org/WoT/) Things.
 
+mod data_schema_validator;
+
 use std::{
+    marker::PhantomData,
     ops::{BitOr, Not},
     rc::Rc,
     str::FromStr,
@@ -90,7 +93,7 @@ where
                     let forms = forms
                         .iter()
                         .filter_map(|form| {
-                            let op = match form.op {
+                            let op = match &form.op {
                                 DefaultedFormOperations::Default
                                     if data_schema.read_only.not()
                                         && data_schema.write_only.not() =>
@@ -106,7 +109,7 @@ where
                                     vec![FormOperation::WriteProperty]
                                 }
                                 DefaultedFormOperations::Default => return None,
-                                DefaultedFormOperations::Custom(_) => todo!(),
+                                DefaultedFormOperations::Custom(ops) => ops.clone(),
                             };
 
                             Some(
@@ -149,7 +152,7 @@ pub enum ConsumeError {
     Form {
         property: String,
         href: String,
-        source: UnsupportedForm,
+        source: InvalidForm,
     },
 }
 
@@ -159,6 +162,16 @@ pub struct Consumer {
     // TODO: other
 }
 
+impl Consumer {
+    #[inline]
+    pub fn property(&self, name: &str) -> Option<&Property> {
+        self.properties
+            .binary_search_by(|prop| prop.name.as_str().cmp(name))
+            .ok()
+            .map(|index| &self.properties[index])
+    }
+}
+
 #[derive(Debug)]
 pub struct Property {
     name: String,
@@ -166,6 +179,12 @@ pub struct Property {
     forms: Vec<Form>,
     uri_variables: Vec<UriVariable>,
     data_schema: DataSchema<(), (), ()>,
+}
+
+impl Property {
+    pub fn read<T>(&self) -> PropertyReader<'_, T> {
+        todo!()
+    }
 }
 
 #[derive(Debug)]
@@ -190,7 +209,7 @@ impl Form {
         form: &thing::Form<Other>,
         op: Vec<FormOperation>,
         schema_definitions: &[SchemaDefinition],
-    ) -> Result<Self, UnsupportedForm>
+    ) -> Result<Self, InvalidForm>
     where
         Other: ExtendableThing,
     {
@@ -209,23 +228,40 @@ impl Form {
 
         if let Some(schema) = href.split_once("://").map(|(schema, _)| schema) {
             if schema != "http" && schema != "https" {
-                return Err(UnsupportedForm::Protocol(schema.to_string()));
+                return Err(InvalidForm::UnsupportedProtocol(schema.to_string()));
             }
         }
 
         let content_type = content_type.clone();
         let content_coding = content_coding.clone();
         let subprotocol = subprotocol
+            .as_deref()
             .map(|subprotocol| {
-                Subprotocol::try_from(&*subprotocol).map_err(UnsupportedForm::Subprotocol)
+                Subprotocol::try_from(subprotocol).map_err(InvalidForm::UnsupportedSubprotocol)
             })
             .transpose()?;
         let security_scheme = security
             .as_deref()
             .try_into()
-            .map_err(UnsupportedForm::Security)?;
-        let expected_response_content_type = response.map(|response| response.content_type.clone());
-        let additional_expected_response = additional_responses.clone();
+            .map_err(InvalidForm::UnsupportedSecurity)?;
+        let expected_response_content_type = response
+            .as_ref()
+            .map(|response| response.content_type.clone());
+        let additional_expected_response = additional_responses
+            .as_ref()
+            .map(|additional_responses| {
+                additional_responses
+                    .iter()
+                    .map(|additional_response| {
+                        AdditionalExpectedResponse::try_from_td_additional_response(
+                            additional_response,
+                            schema_definitions,
+                        )
+                        .map_err(InvalidForm::MissingSchemaDefinition)
+                    })
+                    .collect::<Result<_, _>>()
+            })
+            .transpose()?;
 
         Ok(Self {
             op,
@@ -240,10 +276,11 @@ impl Form {
 }
 
 #[derive(Debug)]
-pub enum UnsupportedForm {
-    Protocol(String),
-    Subprotocol(UnsupportedSubprotocol),
-    Security(UnsupportedSecuritySchemeSet),
+pub enum InvalidForm {
+    UnsupportedProtocol(String),
+    UnsupportedSubprotocol(UnsupportedSubprotocol),
+    UnsupportedSecurity(UnsupportedSecuritySchemeSet),
+    MissingSchemaDefinition(MissingSchemaDefinition),
 }
 
 /// A fixed set of supported protocols.
@@ -375,11 +412,11 @@ impl ScalarDataSchema {
         schema_definitions: &[SchemaDefinition],
     ) -> Result<Self, NonScalarDataSchema> {
         let DataSchema {
-            attype,
-            title,
-            titles,
-            description,
-            descriptions,
+            attype: _,
+            title: _,
+            titles: _,
+            description: _,
+            descriptions: _,
             constant,
             default,
             unit,
@@ -389,7 +426,7 @@ impl ScalarDataSchema {
             write_only,
             format,
             subtype,
-            other,
+            other: _,
         } = value;
 
         let subtype = subtype.as_ref().map(TryInto::try_into).transpose()?;
@@ -407,8 +444,8 @@ impl ScalarDataSchema {
             })
             .transpose()?;
         let enumeration = enumeration.clone();
-        let read_only = read_only.clone();
-        let write_only = write_only.clone();
+        let read_only = *read_only;
+        let write_only = *write_only;
         let format = format.clone();
 
         Ok(Self {
@@ -426,7 +463,7 @@ impl ScalarDataSchema {
 }
 
 #[derive(Debug)]
-struct NonScalarDataSchema;
+pub struct NonScalarDataSchema;
 
 #[derive(Debug)]
 enum ScalarDataSchemaSubtype {
@@ -489,10 +526,12 @@ fn data_schema_without_extensions<DS, AS, OS>(
     let constant = constant.clone();
     let default = default.clone();
     let unit = unit.clone();
-    let one_of = one_of.map(|one_of| one_of.iter().map(data_schema_without_extensions).collect());
+    let one_of = one_of
+        .as_ref()
+        .map(|one_of| one_of.iter().map(data_schema_without_extensions).collect());
     let enumeration = enumeration.clone();
-    let read_only = read_only.clone();
-    let write_only = write_only.clone();
+    let read_only = *read_only;
+    let write_only = *write_only;
     let format = format.clone();
     let subtype = subtype.as_ref().map(data_schema_subtype_without_extensions);
 
@@ -527,10 +566,11 @@ fn data_schema_subtype_without_extensions<DS, AS, OS>(
                 other: _,
             } = array;
 
-            let items =
-                items.map(|items| items.iter().map(data_schema_without_extensions).collect());
-            let min_items = min_items.clone();
-            let max_items = max_items.clone();
+            let items = items
+                .as_ref()
+                .map(|items| items.iter().map(data_schema_without_extensions).collect());
+            let min_items = *min_items;
+            let max_items = *max_items;
 
             DataSchemaSubtype::Array(ArraySchema {
                 items,
@@ -570,4 +610,49 @@ fn data_schema_subtype_without_extensions<DS, AS, OS>(
         DataSchemaSubtype::String(s) => DataSchemaSubtype::String(s.clone()),
         DataSchemaSubtype::Null => DataSchemaSubtype::Null,
     }
+}
+
+#[derive(Debug)]
+pub struct PropertyReader<'a, T>(
+    Result<PropertyReaderInner<'a>, PropertyReaderError>,
+    PhantomData<fn() -> T>,
+);
+
+#[derive(Debug)]
+struct PropertyReaderInner<'a> {
+    property: &'a Property,
+    forms: PartialVecRefs<'a, Form>,
+    uri_variables: Vec<(String, ScalarDataSchema)>,
+}
+
+#[derive(Default)]
+pub enum ReaderSecurityScheme {
+    #[default]
+    NoSecurity,
+    Basic,
+    Bearer,
+}
+
+#[derive(Debug)]
+enum PartialVecRefs<'a, T> {
+    Whole(&'a [T]),
+    Some(Vec<&'a T>),
+}
+
+#[derive(Debug)]
+pub enum PropertyReaderError {}
+
+#[derive(Debug)]
+struct SetUriVariable<'a> {
+    name: String,
+    schema: &'a ScalarDataSchema,
+    value: UriVariableValue,
+}
+
+#[derive(Debug)]
+enum UriVariableValue {
+    String(String),
+    Integer(i64),
+    Number(f64),
+    Boolean(bool),
 }
