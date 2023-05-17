@@ -6,7 +6,7 @@ mod data_schema_validator;
 
 use std::{
     marker::PhantomData,
-    ops::{BitOr, Not},
+    ops::{BitOr, Deref, Not},
     rc::Rc,
     str::FromStr,
 };
@@ -183,7 +183,15 @@ pub struct Property {
 
 impl Property {
     pub fn read<T>(&self) -> PropertyReader<'_, T> {
-        todo!()
+        let inner = PropertyReaderInner {
+            property: self,
+            forms: PartialVecRefs::Whole(&self.forms),
+            uri_variables: Vec::new(),
+        };
+        PropertyReader {
+            status: Ok(inner),
+            _marker: PhantomData,
+        }
     }
 }
 
@@ -613,10 +621,37 @@ fn data_schema_subtype_without_extensions<DS, AS, OS>(
 }
 
 #[derive(Debug)]
-pub struct PropertyReader<'a, T>(
-    Result<PropertyReaderInner<'a>, PropertyReaderError>,
-    PhantomData<fn() -> T>,
-);
+pub struct PropertyReader<'a, T> {
+    status: Result<PropertyReaderInner<'a>, PropertyReaderError>,
+    security: StatefulSecurityScheme,
+    _marker: PhantomData<fn() -> T>,
+}
+
+impl<T> PropertyReader<'_, T> {
+    pub fn no_security(&mut self) -> &mut Self {
+        self.filter_security_scheme(ReaderSecurityScheme::NoSecurity)
+    }
+
+    pub fn basic(&mut self) -> &mut Self {
+        self.filter_security_scheme(ReaderSecurityScheme::NoSecurity)
+    }
+
+    fn filter_security_scheme(&mut self, security_scheme: ReaderSecurityScheme) -> &mut Self {
+        if let Ok(inner) = &mut self.status {
+            inner
+                .forms
+                .retain(|form| form.security_scheme.contains(security_scheme.to_flag()));
+
+            if inner.forms.is_empty() {
+                self.status = Err(PropertyReaderError::UnavailableSecurityScheme(
+                    security_scheme,
+                ));
+            }
+        }
+
+        self
+    }
+}
 
 #[derive(Debug)]
 struct PropertyReaderInner<'a> {
@@ -625,12 +660,33 @@ struct PropertyReaderInner<'a> {
     uri_variables: Vec<(String, ScalarDataSchema)>,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReaderSecurityScheme {
     #[default]
     NoSecurity,
     Basic,
     Bearer,
+}
+
+impl ReaderSecurityScheme {
+    fn to_flag(self) -> SecurityScheme {
+        match self {
+            Self::NoSecurity => SecurityScheme::NO_SECURITY,
+            Self::Basic => SecurityScheme::BASIC,
+            Self::Bearer => SecurityScheme::BEARER,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+enum StatefulSecurityScheme {
+    #[default]
+    NoSecurity,
+    Basic {
+        username: String,
+        password: String,
+    },
+    Bearer(String),
 }
 
 #[derive(Debug)]
@@ -639,8 +695,45 @@ enum PartialVecRefs<'a, T> {
     Some(Vec<&'a T>),
 }
 
+impl<T> PartialVecRefs<'_, T> {
+    fn retain<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&&T) -> bool,
+    {
+        match self {
+            Self::Whole(data) => {
+                if let Some(first_to_remove) = data.iter().position(|element| f(&element).not()) {
+                    let partial = data[..(first_to_remove.saturating_sub(1))]
+                        .iter()
+                        .chain(data[(first_to_remove + 1)..].iter().filter(f))
+                        .collect();
+
+                    *self = Self::Some(partial);
+                }
+            }
+            Self::Some(data) => data.retain(f),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Whole(data) => data.len(),
+            Self::Some(data) => data.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Whole(data) => data.is_empty(),
+            Self::Some(data) => data.is_empty(),
+        }
+    }
+}
+
 #[derive(Debug)]
-pub enum PropertyReaderError {}
+pub enum PropertyReaderError {
+    UnavailableSecurityScheme(ReaderSecurityScheme),
+}
 
 #[derive(Debug)]
 struct SetUriVariable<'a> {
