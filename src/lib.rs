@@ -5,8 +5,9 @@
 mod data_schema_validator;
 
 use std::{
+    convert::identity,
     marker::PhantomData,
-    ops::{BitOr, Deref, Not},
+    ops::{BitOr, Not},
     rc::Rc,
     str::FromStr,
 };
@@ -21,6 +22,7 @@ use wot_td::{
     },
     Thing,
 };
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub async fn consume<Other>(td: &Thing<Other>) -> Result<Consumer, ConsumeError>
 where
@@ -173,7 +175,13 @@ impl Consumer {
 }
 
 #[derive(Debug)]
-pub struct Property {
+pub struct PropertyRef<'a> {
+    property: &'a Property,
+    base: &'a Option<String>,
+}
+
+#[derive(Debug)]
+struct Property {
     name: String,
     observable: bool,
     forms: Vec<Form>,
@@ -181,12 +189,14 @@ pub struct Property {
     data_schema: DataSchema<(), (), ()>,
 }
 
-impl Property {
-    pub fn read<T>(&self) -> PropertyReader<'_, T> {
+impl<'a> PropertyRef<'a> {
+    pub fn read<T>(&self) -> PropertyReader<'a, T> {
         let inner = PropertyReaderInner {
-            property: self,
-            forms: PartialVecRefs::Whole(&self.forms),
+            property: self.property,
+            forms: PartialVecRefs::Whole(&self.property.forms),
             uri_variables: Vec::new(),
+            security: None,
+            base: self.base,
         };
         PropertyReader {
             status: Ok(inner),
@@ -203,6 +213,7 @@ struct UriVariable {
 
 #[derive(Debug)]
 struct Form {
+    href: String,
     op: Vec<FormOperation>,
     content_type: Option<String>,
     content_coding: Option<String>,
@@ -234,12 +245,6 @@ impl Form {
             other: _,
         } = form;
 
-        if let Some(schema) = href.split_once("://").map(|(schema, _)| schema) {
-            if schema != "http" && schema != "https" {
-                return Err(InvalidForm::UnsupportedProtocol(schema.to_string()));
-            }
-        }
-
         let content_type = content_type.clone();
         let content_coding = content_coding.clone();
         let subprotocol = subprotocol
@@ -270,8 +275,10 @@ impl Form {
                     .collect::<Result<_, _>>()
             })
             .transpose()?;
+        let href = href.clone();
 
         Ok(Self {
+            href,
             op,
             content_type,
             content_coding,
@@ -623,29 +630,76 @@ fn data_schema_subtype_without_extensions<DS, AS, OS>(
 #[derive(Debug)]
 pub struct PropertyReader<'a, T> {
     status: Result<PropertyReaderInner<'a>, PropertyReaderError>,
-    security: StatefulSecurityScheme,
     _marker: PhantomData<fn() -> T>,
 }
 
 impl<T> PropertyReader<'_, T> {
     pub fn no_security(&mut self) -> &mut Self {
-        self.filter_security_scheme(ReaderSecurityScheme::NoSecurity)
+        self.filter_security_scheme(StatefulSecurityScheme::NoSecurity)
     }
 
-    pub fn basic(&mut self) -> &mut Self {
-        self.filter_security_scheme(ReaderSecurityScheme::NoSecurity)
+    pub fn basic(&mut self, username: impl Into<String>, password: impl Into<String>) -> &mut Self {
+        let username = username.into();
+        let password = password.into();
+
+        self.filter_security_scheme(StatefulSecurityScheme::Basic { username, password })
     }
 
-    fn filter_security_scheme(&mut self, security_scheme: ReaderSecurityScheme) -> &mut Self {
+    pub fn bearer(&mut self, token: impl Into<String>) -> &mut Self {
+        let token = token.into();
+
+        self.filter_security_scheme(StatefulSecurityScheme::Bearer(token))
+    }
+
+    #[inline]
+    pub fn protocol(&mut self, accepted_protocol: Protocol) -> &mut Self {
+        self.protocols([accepted_protocol].as_slice())
+    }
+
+    pub fn protocols(&mut self, accepted_protocols: &[Protocol]) -> &mut Self {
         if let Ok(inner) = &mut self.status {
-            inner
-                .forms
-                .retain(|form| form.security_scheme.contains(security_scheme.to_flag()));
+            let base_protocol = inner
+                .base
+                .as_deref()
+                .and_then(|base| base.split_once("://"))
+                .and_then(|(schema, _)| schema.parse::<Protocol>().ok())
+                .filter(|protocol| accepted_protocols.contains(protocol));
+
+            inner.forms.retain(|form| {
+                form.href
+                    .split_once("://")
+                    .map(|(schema, _)| schema.parse::<Protocol>().ok())
+                    .map_or(base_protocol, identity)
+                    .map_or(false, |protocol| accepted_protocols.contains(&protocol))
+            });
 
             if inner.forms.is_empty() {
-                self.status = Err(PropertyReaderError::UnavailableSecurityScheme(
-                    security_scheme,
-                ));
+                self.status = Err(PropertyReaderError::UnavailableProtocols);
+            }
+        }
+        self
+    }
+
+    pub fn send(&self) -> Result<PropertyReaderSendFuture, PropertyReaderSendError> {
+        todo!()
+    }
+
+    fn filter_security_scheme(&mut self, security_scheme: StatefulSecurityScheme) -> &mut Self {
+        if let Ok(inner) = &mut self.status {
+            if inner.security.is_none() {
+                inner
+                    .forms
+                    .retain(|form| form.security_scheme.contains(security_scheme.to_flag()));
+
+                if inner.forms.is_empty() {
+                    self.status = Err(PropertyReaderError::UnavailableSecurityScheme(
+                        security_scheme.to_stateless(),
+                    ));
+                } else {
+                    inner.security = Some(security_scheme);
+                }
+            } else {
+                self.status = Err(PropertyReaderError::SecurityAlreadySet);
             }
         }
 
@@ -656,8 +710,10 @@ impl<T> PropertyReader<'_, T> {
 #[derive(Debug)]
 struct PropertyReaderInner<'a> {
     property: &'a Property,
+    base: &'a Option<String>,
     forms: PartialVecRefs<'a, Form>,
     uri_variables: Vec<(String, ScalarDataSchema)>,
+    security: Option<StatefulSecurityScheme>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
@@ -668,17 +724,7 @@ pub enum ReaderSecurityScheme {
     Bearer,
 }
 
-impl ReaderSecurityScheme {
-    fn to_flag(self) -> SecurityScheme {
-        match self {
-            Self::NoSecurity => SecurityScheme::NO_SECURITY,
-            Self::Basic => SecurityScheme::BASIC,
-            Self::Bearer => SecurityScheme::BEARER,
-        }
-    }
-}
-
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Zeroize, ZeroizeOnDrop)]
 enum StatefulSecurityScheme {
     #[default]
     NoSecurity,
@@ -687,6 +733,24 @@ enum StatefulSecurityScheme {
         password: String,
     },
     Bearer(String),
+}
+
+impl StatefulSecurityScheme {
+    fn to_stateless(&self) -> ReaderSecurityScheme {
+        match self {
+            Self::NoSecurity => ReaderSecurityScheme::Basic,
+            Self::Basic { .. } => ReaderSecurityScheme::Basic,
+            Self::Bearer(_) => ReaderSecurityScheme::Bearer,
+        }
+    }
+
+    fn to_flag(&self) -> SecurityScheme {
+        match self {
+            Self::NoSecurity => SecurityScheme::NO_SECURITY,
+            Self::Basic { .. } => SecurityScheme::BASIC,
+            Self::Bearer(_) => SecurityScheme::BEARER,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -733,6 +797,8 @@ impl<T> PartialVecRefs<'_, T> {
 #[derive(Debug)]
 pub enum PropertyReaderError {
     UnavailableSecurityScheme(ReaderSecurityScheme),
+    UnavailableProtocols,
+    SecurityAlreadySet,
 }
 
 #[derive(Debug)]
@@ -748,4 +814,59 @@ enum UriVariableValue {
     Integer(i64),
     Number(f64),
     Boolean(bool),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Protocol {
+    Http,
+    Https,
+}
+
+impl Protocol {
+    #[inline]
+    pub fn to_str(&self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Https => "https",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct UnsupportedProtocol(pub String);
+
+impl FromStr for Protocol {
+    type Err = UnsupportedProtocol;
+
+    #[inline]
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "http" => Self::Http,
+            "https" => Self::Https,
+            _ => return Err(UnsupportedProtocol(s.to_owned())),
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct PropertyReaderSendFuture;
+
+impl PropertyReaderSendFuture {
+    fn new(
+        form: &Form,
+        base: &Option<String>,
+        uri_variables: &[(String, ScalarDataSchema)],
+        security: &StatefulSecurityScheme,
+    ) -> Self {
+        // TODO: move instantiation of reqwest client upstream
+        let client = reqwest::Client::new();
+
+        todo!()
+    }
+}
+
+#[derive(Debug)]
+pub enum PropertyReaderSendError {
+    PropertyReader(PropertyReaderError),
+    MultipleChoices,
 }
