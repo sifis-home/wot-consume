@@ -141,7 +141,8 @@ where
     )?;
 
     properties.sort_unstable_by(|a, b| a.name.cmp(&b.name));
-    Ok(Consumer { properties })
+    let base = td.base.clone();
+    Ok(Consumer { base, properties })
 }
 
 #[derive(Debug)]
@@ -160,17 +161,22 @@ pub enum ConsumeError {
 
 #[derive(Debug)]
 pub struct Consumer {
+    base: Option<String>,
     properties: Vec<Property>,
     // TODO: other
 }
 
 impl Consumer {
     #[inline]
-    pub fn property(&self, name: &str) -> Option<&Property> {
+    pub fn property(&self, name: &str) -> Option<PropertyRef<'_>> {
         self.properties
             .binary_search_by(|prop| prop.name.as_str().cmp(name))
             .ok()
-            .map(|index| &self.properties[index])
+            .map(|index| {
+                let property = &self.properties[index];
+                let base = &self.base;
+                PropertyRef { property, base }
+            })
     }
 }
 
@@ -869,4 +875,103 @@ impl PropertyReaderSendFuture {
 pub enum PropertyReaderSendError {
     PropertyReader(PropertyReaderError),
     MultipleChoices,
+}
+
+mod sealed {
+    use std::ops::Deref;
+
+    use wot_td::{
+        hlist::{self, HListRef, NonEmptyHList},
+        protocol::http::HttpProtocol,
+    };
+
+    use self::peano::Peano;
+
+    pub trait HasHttpExtensionAt<N: Peano> {}
+
+    mod peano {
+        pub struct Zero;
+        pub struct Succ<T: Peano>(T);
+
+        pub trait Peano {
+            const VALUE: usize;
+        }
+
+        impl Peano for Zero {
+            const VALUE: usize = 0;
+        }
+
+        impl<T: Peano> Peano for Succ<T> {
+            const VALUE: usize = T::VALUE + 1;
+        }
+    }
+
+    impl HasHttpExtensionAt<peano::Zero> for (HttpProtocol,) {}
+
+    impl<A> HasHttpExtensionAt<peano::Zero> for (HttpProtocol, A) {}
+    impl<A> HasHttpExtensionAt<peano::Succ<peano::Zero>> for (A, HttpProtocol) {}
+
+    struct True;
+    struct False;
+    trait IsBool {
+        type Value: IsBool;
+    }
+    impl IsBool for True {
+        type Value = True;
+    }
+    impl IsBool for False {
+        type Value = False;
+    }
+
+    struct Or<A, B>(A, B);
+    impl IsBool for Or<False, False> {
+        type Value = False;
+    }
+    impl IsBool for Or<False, True> {
+        type Value = True;
+    }
+    impl IsBool for Or<True, False> {
+        type Value = True;
+    }
+    impl IsBool for Or<True, True> {
+        type Value = True;
+    }
+
+    trait HasHttpProtocol {
+        type Value: IsBool;
+    }
+
+    impl<T> HasHttpProtocol for &&T {
+        type Value = False;
+    }
+
+    impl HasHttpProtocol for &HttpProtocol {
+        type Value = True;
+    }
+
+    trait HlistHasHttpProtocol {
+        type Value: IsBool;
+    }
+
+    impl<T, Init: HasHttpProtocol, Last: HasHttpProtocol> HlistHasHttpProtocol for T
+    where
+        T: hlist::NonEmptyHList,
+        for<'a> &'a T::Init: Deref<Target = Init>,
+        for<'a> &'a T::Last: Deref<Target = Last>,
+        Or<Init::Value, Last::Value>: IsBool,
+    {
+        type Value = <Or<Init::Value, Last::Value> as IsBool>::Value;
+    }
+
+    trait HasHttpExtension {}
+
+    impl<T> HasHttpExtension for T where T: HlistHasHttpProtocol<Value = True> {}
+
+    fn tester<T: HasHttpExtension>(t: T) {
+        todo!()
+    }
+
+    fn test() {
+        tester(hlist::Nil::cons(3i32).cons(HttpProtocol {}));
+    }
 }
