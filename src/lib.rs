@@ -13,8 +13,10 @@ use std::{
 };
 
 use bitflags::bitflags;
+use sealed::{HasHttpProtocolExtension, HasHttpProtocolExtensionForm};
 use wot_td::{
     extend::ExtendableThing,
+    protocol::http,
     thing::{
         self, ArraySchema, DataSchema, DataSchemaSubtype, DefaultedFormOperations, FormOperation,
         IntegerSchema, InteractionAffordance, NumberSchema, ObjectSchema, PropertyAffordance,
@@ -26,7 +28,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub async fn consume<Other>(td: &Thing<Other>) -> Result<Consumer, ConsumeError>
 where
-    Other: ExtendableThing,
+    Other: HasHttpProtocolExtension,
 {
     let mut schema_definitions =
         td.schema_definitions
@@ -227,6 +229,7 @@ struct Form {
     security_scheme: SecurityScheme,
     expected_response_content_type: Option<String>,
     additional_expected_response: Option<Vec<AdditionalExpectedResponse>>,
+    method_name: Option<http::Method>,
 }
 
 impl Form {
@@ -237,6 +240,7 @@ impl Form {
     ) -> Result<Self, InvalidForm>
     where
         Other: ExtendableThing,
+        thing::Form<Other>: HasHttpProtocolExtensionForm,
     {
         let thing::Form {
             op: _,
@@ -248,7 +252,7 @@ impl Form {
             scopes,
             response,
             additional_responses,
-            other: _,
+            other,
         } = form;
 
         let content_type = content_type.clone();
@@ -282,6 +286,7 @@ impl Form {
             })
             .transpose()?;
         let href = href.clone();
+        let method_name = other.http_protocol_form().method.clone();
 
         Ok(Self {
             href,
@@ -292,6 +297,7 @@ impl Form {
             security_scheme,
             expected_response_content_type,
             additional_expected_response,
+            method_name,
         })
     }
 }
@@ -878,100 +884,88 @@ pub enum PropertyReaderSendError {
 }
 
 mod sealed {
-    use std::ops::Deref;
-
     use wot_td::{
+        extend::ExtendableThing,
         hlist::{self, HListRef, NonEmptyHList},
-        protocol::http::HttpProtocol,
+        protocol::http::{self, HttpProtocol},
+        Thing,
     };
 
-    use self::peano::Peano;
+    pub trait HasHttpProtocolExtension {
+        type Form: HasHttpProtocolExtensionForm;
 
-    pub trait HasHttpExtensionAt<N: Peano> {}
+        fn http_protocol(&self) -> &HttpProtocol;
+    }
 
-    mod peano {
-        pub struct Zero;
-        pub struct Succ<T: Peano>(T);
+    pub trait HasHttpProtocolExtensionForm {
+        fn http_protocol_form(&self) -> &http::Form;
+    }
 
-        pub trait Peano {
-            const VALUE: usize;
-        }
+    impl HasHttpProtocolExtension for Thing<HttpProtocol> {
+        type Form = http::Form;
 
-        impl Peano for Zero {
-            const VALUE: usize = 0;
-        }
-
-        impl<T: Peano> Peano for Succ<T> {
-            const VALUE: usize = T::VALUE + 1;
+        #[inline]
+        fn http_protocol(&self) -> &HttpProtocol {
+            self
         }
     }
 
-    impl HasHttpExtensionAt<peano::Zero> for (HttpProtocol,) {}
-
-    impl<A> HasHttpExtensionAt<peano::Zero> for (HttpProtocol, A) {}
-    impl<A> HasHttpExtensionAt<peano::Succ<peano::Zero>> for (A, HttpProtocol) {}
-
-    struct True;
-    struct False;
-    trait IsBool {
-        type Value: IsBool;
-    }
-    impl IsBool for True {
-        type Value = True;
-    }
-    impl IsBool for False {
-        type Value = False;
-    }
-
-    struct Or<A, B>(A, B);
-    impl IsBool for Or<False, False> {
-        type Value = False;
-    }
-    impl IsBool for Or<False, True> {
-        type Value = True;
-    }
-    impl IsBool for Or<True, False> {
-        type Value = True;
-    }
-    impl IsBool for Or<True, True> {
-        type Value = True;
-    }
-
-    trait HasHttpProtocol {
-        type Value: IsBool;
-    }
-
-    impl<T> HasHttpProtocol for &&T {
-        type Value = False;
-    }
-
-    impl HasHttpProtocol for &HttpProtocol {
-        type Value = True;
-    }
-
-    trait HlistHasHttpProtocol {
-        type Value: IsBool;
-    }
-
-    impl<T, Init: HasHttpProtocol, Last: HasHttpProtocol> HlistHasHttpProtocol for T
+    impl<Head, Tail> HasHttpProtocolExtension for Thing<hlist::Cons<Head, Tail>>
     where
-        T: hlist::NonEmptyHList,
-        for<'a> &'a T::Init: Deref<Target = Init>,
-        for<'a> &'a T::Last: Deref<Target = Last>,
-        Or<Init::Value, Last::Value>: IsBool,
+        hlist::Cons<Head, Tail>: ExtendableThing,
+        for<'a> &'a hlist::Cons<Head, Tail>: HListRef<Target = hlist::Cons<&'a Head, &'a Tail>>,
+        for<'a> hlist::Cons<&'a Head, &'a Tail>: NonEmptyHList<Last = &'a HttpProtocol>,
     {
-        type Value = <Or<Init::Value, Last::Value> as IsBool>::Value;
+        type Form = <hlist::Cons<Head, Tail> as ExtendableThing>::Form;
+
+        #[inline]
+        fn http_protocol(&self) -> &HttpProtocol {
+            self.to_ref().split_last().0
+        }
     }
 
-    trait HasHttpExtension {}
-
-    impl<T> HasHttpExtension for T where T: HlistHasHttpProtocol<Value = True> {}
-
-    fn tester<T: HasHttpExtension>(t: T) {
-        todo!()
+    impl<Other> HasHttpProtocolExtensionForm for wot_td::thing::Form<Other>
+    where
+        Other: HasHttpProtocolExtension,
+    {
+        fn http_protocol_form(&self) -> &http::Form {
+            todo!()
+        }
     }
 
-    fn test() {
-        tester(hlist::Nil::cons(3i32).cons(HttpProtocol {}));
+    // impl HasHttpProtocolExtensionForm for wot_td::thing::Form<HttpProtocol> {
+    //     fn http_protocol_form(&self) -> &http::Form {
+    //         &self.other
+    //     }
+    // }
+
+    // impl<Head, Tail, FormHead, FormTail> HasHttpProtocolExtensionForm
+    //     for wot_td::thing::Form<hlist::Cons<Head, Tail>>
+    // where
+    //     hlist::Cons<Head, Tail>: ExtendableThing<Form = hlist::Cons<FormHead, FormTail>>,
+    //     for<'a> &'a hlist::Cons<FormHead, FormTail>:
+    //         HListRef<Target = hlist::Cons<&'a FormHead, &'a FormTail>>,
+    //     for<'a> hlist::Cons<&'a FormHead, &'a FormTail>: NonEmptyHList<Last = &'a http::Form>,
+    // {
+    //     #[inline]
+    //     fn http_protocol_form(&self) -> &http::Form {
+    //         self.other.to_ref().split_last().0
+    //     }
+    // }
+
+    #[cfg(test)]
+    mod tests {
+        use wot_td::protocol::coap::CoapProtocol;
+
+        use super::*;
+
+        #[test]
+        fn http_protocol() {
+            let proto = HttpProtocol {};
+            assert!(std::ptr::eq(proto.http_protocol(), &proto));
+
+            let list = hlist::Nil::cons(HttpProtocol {}).cons(CoapProtocol {});
+            // let http: &HttpProtocol = list.http_protocol();
+        }
     }
 }
