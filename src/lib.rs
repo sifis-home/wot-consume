@@ -6,6 +6,7 @@ mod data_schema_validator;
 
 use std::{
     convert::identity,
+    future::Future,
     marker::PhantomData,
     ops::{BitOr, Not},
     rc::Rc,
@@ -13,7 +14,8 @@ use std::{
 };
 
 use bitflags::bitflags;
-use sealed::{HasHttpProtocolExtension, HasHttpProtocolExtensionForm};
+use reqwest::Url;
+use sealed::HasHttpProtocolExtension;
 use wot_td::{
     extend::ExtendableThing,
     protocol::http,
@@ -28,7 +30,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub async fn consume<Other>(td: &Thing<Other>) -> Result<Consumer, ConsumeError>
 where
-    Other: HasHttpProtocolExtension,
+    Other: HasHttpProtocolExtension + ExtendableThing,
 {
     let mut schema_definitions =
         td.schema_definitions
@@ -239,8 +241,7 @@ impl Form {
         schema_definitions: &[SchemaDefinition],
     ) -> Result<Self, InvalidForm>
     where
-        Other: ExtendableThing,
-        thing::Form<Other>: HasHttpProtocolExtensionForm,
+        Other: HasHttpProtocolExtension,
     {
         let thing::Form {
             op: _,
@@ -286,7 +287,7 @@ impl Form {
             })
             .transpose()?;
         let href = href.clone();
-        let method_name = other.http_protocol_form().method.clone();
+        let method_name = Other::http_protocol_form(other).method_name.clone();
 
         Ok(Self {
             href,
@@ -501,6 +502,15 @@ enum ScalarDataSchemaSubtype {
     Null,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum ScalarValue {
+    Boolean(bool),
+    Number(f64),
+    Integer(i64),
+    String(String),
+    Null,
+}
+
 impl<DS, AS, OS> TryFrom<&DataSchemaSubtype<DS, AS, OS>> for ScalarDataSchemaSubtype {
     type Error = NonScalarDataSchema;
 
@@ -692,6 +702,14 @@ impl<T> PropertyReader<'_, T> {
         self
     }
 
+    pub fn uri_variable(
+        &mut self,
+        name: impl Into<String>,
+        value: impl TryInto<ScalarValue>,
+    ) -> &mut Self {
+        todo!()
+    }
+
     pub fn send(&self) -> Result<PropertyReaderSendFuture, PropertyReaderSendError> {
         todo!()
     }
@@ -724,7 +742,7 @@ struct PropertyReaderInner<'a> {
     property: &'a Property,
     base: &'a Option<String>,
     forms: PartialVecRefs<'a, Form>,
-    uri_variables: Vec<(String, ScalarDataSchema)>,
+    uri_variables: Vec<(String, ScalarValue)>,
     security: Option<StatefulSecurityScheme>,
 }
 
@@ -860,8 +878,12 @@ impl FromStr for Protocol {
     }
 }
 
-#[derive(Debug)]
-pub struct PropertyReaderSendFuture;
+pub struct PropertyReaderSendFuture(
+    Result<
+        Box<dyn Future<Output = Result<reqwest::Response, reqwest::Error>>>,
+        PropertyReaderSendFutureError,
+    >,
+);
 
 impl PropertyReaderSendFuture {
     fn new(
@@ -873,6 +895,63 @@ impl PropertyReaderSendFuture {
         // TODO: move instantiation of reqwest client upstream
         let client = reqwest::Client::new();
 
+        let url = form
+            .href
+            .parse::<Url>()
+            .or_else(|err| match err {
+                url::ParseError::RelativeUrlWithoutBase => base
+                    .as_ref()
+                    .ok_or_else(|| {
+                        PropertyReaderSendFutureError::RelativeUrlWithoutBase(form.href.clone())
+                    })
+                    .and_then(|base| {
+                        base.parse::<Url>().map_err(|source| {
+                            PropertyReaderSendFutureError::InvalidBase {
+                                base: base.to_string(),
+                                href: form.href.clone(),
+                                source,
+                            }
+                        })
+                    })
+                    .and_then(|base| {
+                        base.join(&form.href).map_err(|source| {
+                            PropertyReaderSendFutureError::InvalidJoinedHref {
+                                base,
+                                href: form.href.clone(),
+                                source,
+                            }
+                        })
+                    }),
+                _ => Err(PropertyReaderSendFutureError::InvalidHref {
+                    href: form.href.clone(),
+                    source: err,
+                }),
+            })
+            .and_then(|mut url| {
+                let mut query_pairs = url.query_pairs_mut();
+
+                uri_variables
+                    .iter()
+                    .try_fold(String::new(), |buffer, (name, value)| todo!());
+                todo!()
+            });
+        let url = match url {
+            Ok(url) => url,
+            Err(err) => return Self(Err(err)),
+        };
+
+        let method = form.method_name.map_or(reqwest::Method::GET, |method| {
+            use http::Method;
+            match method {
+                Method::Get => reqwest::Method::GET,
+                Method::Put => reqwest::Method::PUT,
+                Method::Post => reqwest::Method::POST,
+                Method::Delete => reqwest::Method::DELETE,
+                Method::Patch => reqwest::Method::PATCH,
+            }
+        });
+        let builder = client.request(method, url);
+
         todo!()
     }
 }
@@ -883,75 +962,137 @@ pub enum PropertyReaderSendError {
     MultipleChoices,
 }
 
+#[derive(Debug)]
+pub enum PropertyReaderSendFutureError {
+    InvalidHref {
+        href: String,
+        source: url::ParseError,
+    },
+    RelativeUrlWithoutBase(String),
+    InvalidBase {
+        base: String,
+        href: String,
+        source: url::ParseError,
+    },
+    InvalidJoinedHref {
+        base: Url,
+        href: String,
+        source: url::ParseError,
+    },
+}
+
 mod sealed {
     use wot_td::{
         extend::ExtendableThing,
         hlist::{self, HListRef, NonEmptyHList},
         protocol::http::{self, HttpProtocol},
-        Thing,
     };
 
-    pub trait HasHttpProtocolExtension {
-        type Form: HasHttpProtocolExtensionForm;
-
+    pub trait HasHttpProtocolExtension: Sized + ExtendableThing {
         fn http_protocol(&self) -> &HttpProtocol;
+        fn http_protocol_form(form: &Self::Form) -> &http::Form;
     }
 
-    pub trait HasHttpProtocolExtensionForm {
-        fn http_protocol_form(&self) -> &http::Form;
-    }
-
-    impl HasHttpProtocolExtension for Thing<HttpProtocol> {
-        type Form = http::Form;
-
+    impl HasHttpProtocolExtension for HttpProtocol {
         #[inline]
         fn http_protocol(&self) -> &HttpProtocol {
             self
         }
-    }
-
-    impl<Head, Tail> HasHttpProtocolExtension for Thing<hlist::Cons<Head, Tail>>
-    where
-        hlist::Cons<Head, Tail>: ExtendableThing,
-        for<'a> &'a hlist::Cons<Head, Tail>: HListRef<Target = hlist::Cons<&'a Head, &'a Tail>>,
-        for<'a> hlist::Cons<&'a Head, &'a Tail>: NonEmptyHList<Last = &'a HttpProtocol>,
-    {
-        type Form = <hlist::Cons<Head, Tail> as ExtendableThing>::Form;
 
         #[inline]
-        fn http_protocol(&self) -> &HttpProtocol {
-            self.to_ref().split_last().0
+        fn http_protocol_form(form: &Self::Form) -> &http::Form {
+            form
         }
     }
 
-    impl<Other> HasHttpProtocolExtensionForm for wot_td::thing::Form<Other>
-    where
-        Other: HasHttpProtocolExtension,
-    {
-        fn http_protocol_form(&self) -> &http::Form {
-            todo!()
-        }
+    macro_rules! impl_hlist_with_http_protocol_in_head {
+        (
+            @make_hlist
+        ) => {
+            hlist::Cons<HttpProtocol>
+        };
+
+        (
+            @make_hlist
+            $generic:ident $(, $($rest:tt)*)?
+        ) => {
+           hlist::Cons<
+               $generic,
+               impl_hlist_with_http_protocol_in_head!(@make_hlist $($($rest)*)?),
+            >
+        };
+
+        (
+            @make_impl
+            $(
+                $($generic:ident),+
+            )?
+        ) => {
+            impl $(< $($generic),+ >)? HasHttpProtocolExtension for impl_hlist_with_http_protocol_in_head!(@make_hlist $($($generic),+)?)
+            $(
+                where
+                    $(
+                        $generic : wot_td::extend::ExtendableThing
+                    ),+
+            )?
+            {
+                #[inline]
+                fn http_protocol(&self) -> &HttpProtocol {
+                    self.to_ref().split_last().0
+                }
+
+                #[inline]
+                fn http_protocol_form(form: &Self::Form) -> &http::Form {
+                    form.to_ref().split_last().0
+                }
+            }
+        };
+
+        (
+            $(
+                $($generic:ident),* $(,)?
+            );+
+        ) => {
+            $(
+                impl_hlist_with_http_protocol_in_head!(@make_impl $($generic),*);
+            )*
+        };
     }
 
-    // impl HasHttpProtocolExtensionForm for wot_td::thing::Form<HttpProtocol> {
-    //     fn http_protocol_form(&self) -> &http::Form {
-    //         &self.other
-    //     }
-    // }
-
-    // impl<Head, Tail, FormHead, FormTail> HasHttpProtocolExtensionForm
-    //     for wot_td::thing::Form<hlist::Cons<Head, Tail>>
-    // where
-    //     hlist::Cons<Head, Tail>: ExtendableThing<Form = hlist::Cons<FormHead, FormTail>>,
-    //     for<'a> &'a hlist::Cons<FormHead, FormTail>:
-    //         HListRef<Target = hlist::Cons<&'a FormHead, &'a FormTail>>,
-    //     for<'a> hlist::Cons<&'a FormHead, &'a FormTail>: NonEmptyHList<Last = &'a http::Form>,
-    // {
-    //     #[inline]
-    //     fn http_protocol_form(&self) -> &http::Form {
-    //         self.other.to_ref().split_last().0
-    //     }
-    // }
+    impl_hlist_with_http_protocol_in_head!(
+        A;
+        A, B;
+        A, B, C;
+        A, B, C, D;
+        A, B, C, D, E;
+        A, B, C, D, E, F;
+        A, B, C, D, E, F, G;
+        A, B, C, D, E, F, G, H;
+        A, B, C, D, E, F, G, H, I;
+        A, B, C, D, E, F, G, H, I, J;
+        A, B, C, D, E, F, G, H, I, J, K;
+        A, B, C, D, E, F, G, H, I, J, K, L;
+        A, B, C, D, E, F, G, H, I, J, K, L, M;
+        A, B, C, D, E, F, G, H, I, J, K, L, M, N;
+        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O;
+        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P;
+        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q;
+        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R;
+        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S;
+        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T;
+        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U;
+        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V;
+        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W;
+        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X;
+        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y;
+        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z;
+        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z, AA;
+        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z, AA, AB;
+        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z, AA, AB, AC;
+        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z, AA, AB, AC, AD;
+        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z, AA, AB, AC, AD, AE;
+        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z, AA, AB, AC, AD, AE, AF;
+    );
 
     #[cfg(test)]
     mod tests {
@@ -964,8 +1105,11 @@ mod sealed {
             let proto = HttpProtocol {};
             assert!(std::ptr::eq(proto.http_protocol(), &proto));
 
-            let list = hlist::Nil::cons(HttpProtocol {}).cons(CoapProtocol {});
-            // let http: &HttpProtocol = list.http_protocol();
+            let list = hlist::Nil::cons(HttpProtocol {})
+                .cons(CoapProtocol {})
+                .cons(CoapProtocol {})
+                .cons(CoapProtocol {});
+            let _http: &HttpProtocol = list.http_protocol();
         }
     }
 }
