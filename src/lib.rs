@@ -5,7 +5,9 @@
 mod data_schema_validator;
 
 use std::{
+    cmp,
     convert::identity,
+    fmt::{self, Display},
     future::Future,
     marker::PhantomData,
     ops::{BitOr, Not},
@@ -21,8 +23,8 @@ use wot_td::{
     protocol::http,
     thing::{
         self, ArraySchema, DataSchema, DataSchemaSubtype, DefaultedFormOperations, FormOperation,
-        IntegerSchema, InteractionAffordance, NumberSchema, ObjectSchema, PropertyAffordance,
-        StringSchema,
+        IntegerSchema, InteractionAffordance, Minimum, NumberSchema, ObjectSchema,
+        PropertyAffordance, StringSchema,
     },
     Thing,
 };
@@ -287,7 +289,7 @@ impl Form {
             })
             .transpose()?;
         let href = href.clone();
-        let method_name = Other::http_protocol_form(other).method_name.clone();
+        let method_name = Other::http_protocol_form(other).method_name;
 
         Ok(Self {
             href,
@@ -502,15 +504,6 @@ enum ScalarDataSchemaSubtype {
     Null,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-enum ScalarValue {
-    Boolean(bool),
-    Number(f64),
-    Integer(i64),
-    String(String),
-    Null,
-}
-
 impl<DS, AS, OS> TryFrom<&DataSchemaSubtype<DS, AS, OS>> for ScalarDataSchemaSubtype {
     type Error = NonScalarDataSchema;
 
@@ -651,7 +644,7 @@ fn data_schema_subtype_without_extensions<DS, AS, OS>(
 
 #[derive(Debug)]
 pub struct PropertyReader<'a, T> {
-    status: Result<PropertyReaderInner<'a>, PropertyReaderError>,
+    status: Result<PropertyReaderInner<'a>, PropertyReaderError<'a>>,
     _marker: PhantomData<fn() -> T>,
 }
 
@@ -696,17 +689,41 @@ impl<T> PropertyReader<'_, T> {
             });
 
             if inner.forms.is_empty() {
-                self.status = Err(PropertyReaderError::UnavailableProtocols);
+                self.status = Err(PropertyReaderError {
+                    property: inner.property,
+                    kind: PropertyReaderErrorKind::UnavailableProtocols,
+                });
             }
         }
         self
     }
 
-    pub fn uri_variable(
-        &mut self,
-        name: impl Into<String>,
-        value: impl TryInto<ScalarValue>,
-    ) -> &mut Self {
+    // TODO: check if we can make `value: impl TryInto<UriVariableValue>`, the type of error could
+    // be annyoing because of the `Infallible` conversions.
+    pub fn uri_variable<N>(&mut self, name: N, value: UriVariableValue) -> &mut Self
+    where
+        N: Into<String> + AsRef<str>,
+    {
+        let Ok(inner) = &mut self.status else {
+            return self;
+        };
+
+        let name_str = name.as_ref();
+        let uri_variable = inner
+            .property
+            .uri_variables
+            .binary_search_by(|uri_variable| uri_variable.name.as_str().cmp(name_str))
+            .map(|index| &inner.property.uri_variables[index]);
+
+        let Ok(uri_variable) = uri_variable else {
+            self.status = Err(PropertyReaderError {
+                property: inner.property,
+                kind: PropertyReaderErrorKind::UnavailableUriVariable(name.into()),
+            });
+            return self;
+        };
+
+        validate_uri_variable_value(uri_variable, value);
         todo!()
     }
 
@@ -722,14 +739,20 @@ impl<T> PropertyReader<'_, T> {
                     .retain(|form| form.security_scheme.contains(security_scheme.to_flag()));
 
                 if inner.forms.is_empty() {
-                    self.status = Err(PropertyReaderError::UnavailableSecurityScheme(
-                        security_scheme.to_stateless(),
-                    ));
+                    self.status = Err(PropertyReaderError {
+                        property: inner.property,
+                        kind: PropertyReaderErrorKind::UnavailableSecurityScheme(
+                            security_scheme.to_stateless(),
+                        ),
+                    });
                 } else {
                     inner.security = Some(security_scheme);
                 }
             } else {
-                self.status = Err(PropertyReaderError::SecurityAlreadySet);
+                self.status = Err(PropertyReaderError {
+                    property: inner.property,
+                    kind: PropertyReaderErrorKind::SecurityAlreadySet,
+                });
             }
         }
 
@@ -742,7 +765,7 @@ struct PropertyReaderInner<'a> {
     property: &'a Property,
     base: &'a Option<String>,
     forms: PartialVecRefs<'a, Form>,
-    uri_variables: Vec<(String, ScalarValue)>,
+    uri_variables: Vec<(String, UriVariableValue)>,
     security: Option<StatefulSecurityScheme>,
 }
 
@@ -825,25 +848,50 @@ impl<T> PartialVecRefs<'_, T> {
 }
 
 #[derive(Debug)]
-pub enum PropertyReaderError {
+pub struct PropertyReaderError<'a> {
+    property: &'a Property,
+    pub kind: PropertyReaderErrorKind,
+}
+
+#[derive(Debug)]
+pub enum PropertyReaderErrorKind {
     UnavailableSecurityScheme(ReaderSecurityScheme),
     UnavailableProtocols,
     SecurityAlreadySet,
+    UnavailableUriVariable(String),
 }
 
-#[derive(Debug)]
-struct SetUriVariable<'a> {
-    name: String,
-    schema: &'a ScalarDataSchema,
-    value: UriVariableValue,
-}
-
-#[derive(Debug)]
-enum UriVariableValue {
+#[derive(Debug, PartialEq)]
+pub enum UriVariableValue {
     String(String),
     Integer(i64),
     Number(f64),
     Boolean(bool),
+}
+
+impl PartialEq<serde_json::Value> for UriVariableValue {
+    fn eq(&self, other: &serde_json::Value) -> bool {
+        use serde_json::Value;
+
+        match (self, other) {
+            (Self::String(a), Value::String(b)) => a == b,
+            (Self::Integer(a), Value::Number(b)) => b.as_i64().map_or(false, |b| a == &b),
+            (Self::Number(a), Value::Number(b)) => b.as_f64().map_or(false, |b| a == &b),
+            (Self::Boolean(a), Value::Bool(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Display for UriVariableValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::String(s) => f.write_str(s),
+            Self::Integer(i) => write!(f, "{}", i),
+            Self::Number(n) => write!(f, "{}", n),
+            Self::Boolean(b) => write!(f, "{}", b),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -889,7 +937,7 @@ impl PropertyReaderSendFuture {
     fn new(
         form: &Form,
         base: &Option<String>,
-        uri_variables: &[(String, ScalarDataSchema)],
+        uri_variables: &[(String, UriVariableValue)],
         security: &StatefulSecurityScheme,
     ) -> Self {
         // TODO: move instantiation of reqwest client upstream
@@ -927,13 +975,20 @@ impl PropertyReaderSendFuture {
                     source: err,
                 }),
             })
-            .and_then(|mut url| {
-                let mut query_pairs = url.query_pairs_mut();
+            .map(|mut url| {
+                use std::fmt::Write;
 
-                uri_variables
-                    .iter()
-                    .try_fold(String::new(), |buffer, (name, value)| todo!());
-                todo!()
+                let mut query_pairs = url.query_pairs_mut();
+                let mut buffer = String::new();
+
+                for (name, value) in uri_variables {
+                    buffer.clear();
+                    write!(buffer, "{}", value).unwrap();
+                    query_pairs.append_pair(name, &buffer);
+                }
+
+                drop(query_pairs);
+                url
             });
         let url = match url {
             Ok(url) => url,
@@ -957,8 +1012,8 @@ impl PropertyReaderSendFuture {
 }
 
 #[derive(Debug)]
-pub enum PropertyReaderSendError {
-    PropertyReader(PropertyReaderError),
+pub enum PropertyReaderSendError<'a> {
+    PropertyReader(PropertyReaderError<'a>),
     MultipleChoices,
 }
 
@@ -979,6 +1034,105 @@ pub enum PropertyReaderSendFutureError {
         href: String,
         source: url::ParseError,
     },
+}
+
+fn validate_uri_variable_value(
+    schema: &ScalarDataSchema,
+    value: &UriVariableValue,
+) -> Result<(), InvalidUriVariableKind> {
+    if let Some(constant) = &schema.constant {
+        if value != constant {
+            return Err(InvalidUriVariableKind::Constant(constant.clone()));
+        }
+    }
+
+    if let Some(enumeration) = &schema.enumeration {
+        if enumeration.iter().any(|variant| value == variant).not() {
+            return Err(InvalidUriVariableKind::Enumeration(enumeration.clone()));
+        }
+    }
+
+    if let Some(subtype) = &schema.subtype {
+        match subtype {
+            ScalarDataSchemaSubtype::Boolean => {
+                if matches!(value, UriVariableValue::Boolean(_)).not() {
+                    return Err(InvalidUriVariableKind::Subtype(
+                        InvalidUriVariableKindSubtype::Boolean,
+                    ));
+                }
+            }
+            ScalarDataSchemaSubtype::Number(schema) => {
+                let UriVariableValue::Number(value) = value else {
+                    return Err(InvalidUriVariableKind::Subtype(
+                        InvalidUriVariableKindSubtype::Number(
+                            InvalidUriVariableKindSubtypeNumber::Type
+                        )
+                    ));
+                };
+
+                if let Some(minimum) = &schema.minimum {
+                    if is_above_minimum(value, minimum).not() {
+                        return Err(InvalidUriVariableKind::Subtype(
+                            InvalidUriVariableKindSubtype::Number(
+                                InvalidUriVariableKindSubtypeNumber::BelowMinimum(minimum.clone()),
+                            ),
+                        ));
+                    }
+
+                    todo!()
+                }
+
+                todo!()
+            }
+            ScalarDataSchemaSubtype::Integer(_) => todo!(),
+            ScalarDataSchemaSubtype::String(_) => todo!(),
+            ScalarDataSchemaSubtype::Null => todo!(),
+        }
+    }
+
+    todo!()
+}
+
+fn is_above_minimum<T>(value: &T, minimum: &Minimum<T>) -> bool
+where
+    T: PartialOrd,
+{
+    match minimum {
+        Minimum::Inclusive(minimum) => value >= minimum,
+        Minimum::Exclusive(minimum) => value > minimum,
+    }
+}
+
+#[derive(Debug)]
+pub enum InvalidUriVariableKind {
+    Constant(serde_json::Value),
+    Enumeration(Vec<serde_json::Value>),
+    Subtype(InvalidUriVariableKindSubtype),
+}
+
+#[derive(Debug)]
+pub enum InvalidUriVariableKindSubtype {
+    Boolean,
+    Number(InvalidUriVariableKindSubtypeNumber),
+    Integer(InvalidUriVariableKindSubtypeInteger),
+    String(InvalidUriVariableKindSubtypeString),
+    Null,
+}
+
+#[derive(Debug)]
+pub enum InvalidUriVariableKindSubtypeNumber {
+    Type,
+    BelowMinimum(Minimum<f64>),
+}
+
+#[derive(Debug)]
+pub enum InvalidUriVariableKindSubtypeInteger {
+    Type,
+}
+
+#[derive(Debug)]
+pub enum InvalidUriVariableKindSubtypeString {
+    Type,
 }
 
 mod sealed {
