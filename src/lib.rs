@@ -5,25 +5,27 @@
 mod data_schema_validator;
 
 use std::{
-    cmp,
     convert::identity,
     fmt::{self, Display},
     future::Future,
     marker::PhantomData,
+    num::NonZeroU64,
     ops::{BitOr, Not},
     rc::Rc,
     str::FromStr,
 };
 
 use bitflags::bitflags;
+use regex::Regex;
 use reqwest::Url;
 use sealed::HasHttpProtocolExtension;
+use tracing::warn;
 use wot_td::{
     extend::ExtendableThing,
     protocol::http,
     thing::{
         self, ArraySchema, DataSchema, DataSchemaSubtype, DefaultedFormOperations, FormOperation,
-        IntegerSchema, InteractionAffordance, Minimum, NumberSchema, ObjectSchema,
+        IntegerSchema, InteractionAffordance, Maximum, Minimum, NumberSchema, ObjectSchema,
         PropertyAffordance, StringSchema,
     },
     Thing,
@@ -723,7 +725,15 @@ impl<T> PropertyReader<'_, T> {
             return self;
         };
 
-        validate_uri_variable_value(uri_variable, value);
+        if let Err(err) = validate_uri_variable_value(&uri_variable.schema, &value) {
+            self.status = Err(PropertyReaderError {
+                property: inner.property,
+                kind: PropertyReaderErrorKind::InvalidUriVariable {
+                    uri_variable: uri_variable.name.clone(),
+                    kind: err,
+                },
+            });
+        };
         todo!()
     }
 
@@ -859,6 +869,10 @@ pub enum PropertyReaderErrorKind {
     UnavailableProtocols,
     SecurityAlreadySet,
     UnavailableUriVariable(String),
+    InvalidUriVariable {
+        uri_variable: String,
+        kind: InvalidUriVariableKind,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -1065,7 +1079,7 @@ fn validate_uri_variable_value(
                 let UriVariableValue::Number(value) = value else {
                     return Err(InvalidUriVariableKind::Subtype(
                         InvalidUriVariableKindSubtype::Number(
-                            InvalidUriVariableKindSubtypeNumber::Type
+                            InvalidUriVariableKindSubtypeNumeric::Type
                         )
                     ));
                 };
@@ -1074,19 +1088,155 @@ fn validate_uri_variable_value(
                     if is_above_minimum(value, minimum).not() {
                         return Err(InvalidUriVariableKind::Subtype(
                             InvalidUriVariableKindSubtype::Number(
-                                InvalidUriVariableKindSubtypeNumber::BelowMinimum(minimum.clone()),
+                                InvalidUriVariableKindSubtypeNumeric::BelowMinimum(*minimum),
                             ),
                         ));
                     }
-
-                    todo!()
                 }
 
-                todo!()
+                if let Some(maximum) = &schema.maximum {
+                    if is_below_maximum(value, maximum).not() {
+                        return Err(InvalidUriVariableKind::Subtype(
+                            InvalidUriVariableKindSubtype::Number(
+                                InvalidUriVariableKindSubtypeNumeric::AboveMaximum(*maximum),
+                            ),
+                        ));
+                    }
+                }
+
+                if let Some(multiple_of) = schema.multiple_of {
+                    // We should **never** get `multiple_of` less or equal than 0, this condition
+                    // should be checked during the deserialization of the TD. If this prerequisite
+                    // is not satisfied, we just consider the multiplicative constraint not
+                    // satisfied.
+                    let is_multiple_of =
+                        multiple_of > 0. && f64::abs(value % multiple_of) < f64::EPSILON;
+
+                    if is_multiple_of.not() {
+                        return Err(InvalidUriVariableKind::Subtype(
+                            InvalidUriVariableKindSubtype::Number(
+                                InvalidUriVariableKindSubtypeNumeric::NotMultipleOf(multiple_of),
+                            ),
+                        ));
+                    }
+                }
             }
-            ScalarDataSchemaSubtype::Integer(_) => todo!(),
-            ScalarDataSchemaSubtype::String(_) => todo!(),
-            ScalarDataSchemaSubtype::Null => todo!(),
+            ScalarDataSchemaSubtype::Integer(schema) => {
+                let UriVariableValue::Integer(value) = value else {
+                    return Err(InvalidUriVariableKind::Subtype(
+                        InvalidUriVariableKindSubtype::Integer(
+                            InvalidUriVariableKindSubtypeNumeric::Type
+                        )
+                    ));
+                };
+
+                if let Some(minimum) = &schema.minimum {
+                    if is_above_minimum(value, minimum).not() {
+                        return Err(InvalidUriVariableKind::Subtype(
+                            InvalidUriVariableKindSubtype::Integer(
+                                InvalidUriVariableKindSubtypeNumeric::BelowMinimum(*minimum),
+                            ),
+                        ));
+                    }
+                }
+
+                if let Some(maximum) = &schema.maximum {
+                    if is_below_maximum(value, maximum).not() {
+                        return Err(InvalidUriVariableKind::Subtype(
+                            InvalidUriVariableKindSubtype::Integer(
+                                InvalidUriVariableKindSubtypeNumeric::AboveMaximum(*maximum),
+                            ),
+                        ));
+                    }
+                }
+
+                if let Some(multiple_of) = schema.multiple_of {
+                    // Reasoning: if the value of `multiply_of` is above i64::MAX, the value cannot
+                    // be a multiple of that. Otherwise we check the modulo, and because we only
+                    // need to check whether it is zero or not, it does not matter if we use the
+                    // truncated (%) or the euclidean form.
+                    let is_multiple_of = i64::try_from(multiple_of.get())
+                        .ok()
+                        .map_or(false, |multiple_of| value % multiple_of == 0);
+
+                    if is_multiple_of.not() {
+                        return Err(InvalidUriVariableKind::Subtype(
+                            InvalidUriVariableKindSubtype::Integer(
+                                InvalidUriVariableKindSubtypeNumeric::NotMultipleOf(multiple_of),
+                            ),
+                        ));
+                    }
+                }
+            }
+            ScalarDataSchemaSubtype::String(schema) => {
+                let UriVariableValue::String(value) = value else {
+                    return Err(InvalidUriVariableKind::Subtype(
+                        InvalidUriVariableKindSubtype::String(
+                            InvalidUriVariableKindSubtypeString::Type
+                        )
+                    ));
+                };
+
+                if schema.content_encoding.is_some() {
+                    warn!("content encoding is still not supported");
+                }
+
+                if schema.min_length.is_some() || schema.max_length.is_some() {
+                    // Quote from the WoT-TD 1.1 spec:
+                    //
+                    // The length of a string (i.e., minLength and maxLength) is defined as the
+                    // number of Unicode code points, as defined by RFC8259.
+                    let code_points = value.chars().count();
+                    let code_points_u32 = u32::try_from(code_points);
+
+                    if let Some(min_length) = schema.min_length {
+                        if code_points_u32.map_or(true, |code_points| code_points < min_length) {
+                            return Err(InvalidUriVariableKind::Subtype(
+                                InvalidUriVariableKindSubtype::String(
+                                    InvalidUriVariableKindSubtypeString::MinLength {
+                                        expected: min_length,
+                                        actual: code_points,
+                                    },
+                                ),
+                            ));
+                        }
+                    }
+
+                    if let Some(max_length) = schema.max_length {
+                        if code_points_u32.map_or(true, |code_points| code_points > max_length) {
+                            return Err(InvalidUriVariableKind::Subtype(
+                                InvalidUriVariableKindSubtype::String(
+                                    InvalidUriVariableKindSubtypeString::MaxLength {
+                                        expected: max_length,
+                                        actual: code_points,
+                                    },
+                                ),
+                            ));
+                        }
+                    }
+                }
+
+                if let Some(pattern) = &schema.pattern {
+                    let is_valid_pattern =
+                        Regex::new(pattern).map_or(false, |regex| regex.is_match(value));
+                    if is_valid_pattern.not() {
+                        return Err(InvalidUriVariableKind::Subtype(
+                            InvalidUriVariableKindSubtype::String(
+                                InvalidUriVariableKindSubtypeString::Pattern {
+                                    pattern: pattern.clone(),
+                                    string: value.clone(),
+                                },
+                            ),
+                        ));
+                    }
+                }
+            }
+            ScalarDataSchemaSubtype::Null => {
+                // There is no possible way to universally represent a null uri variable.
+                return Err(InvalidUriVariableKind::Subtype(
+                    InvalidUriVariableKindSubtype::Null,
+                ));
+            }
         }
     }
 
@@ -1103,6 +1253,16 @@ where
     }
 }
 
+fn is_below_maximum<T>(value: &T, maximum: &Maximum<T>) -> bool
+where
+    T: PartialOrd,
+{
+    match maximum {
+        Maximum::Inclusive(maximum) => value <= maximum,
+        Maximum::Exclusive(maximum) => value < maximum,
+    }
+}
+
 #[derive(Debug)]
 pub enum InvalidUriVariableKind {
     Constant(serde_json::Value),
@@ -1113,26 +1273,26 @@ pub enum InvalidUriVariableKind {
 #[derive(Debug)]
 pub enum InvalidUriVariableKindSubtype {
     Boolean,
-    Number(InvalidUriVariableKindSubtypeNumber),
-    Integer(InvalidUriVariableKindSubtypeInteger),
+    Number(InvalidUriVariableKindSubtypeNumeric<f64, f64>),
+    Integer(InvalidUriVariableKindSubtypeNumeric<i64, NonZeroU64>),
     String(InvalidUriVariableKindSubtypeString),
     Null,
 }
 
 #[derive(Debug)]
-pub enum InvalidUriVariableKindSubtypeNumber {
+pub enum InvalidUriVariableKindSubtypeNumeric<T, U> {
     Type,
-    BelowMinimum(Minimum<f64>),
-}
-
-#[derive(Debug)]
-pub enum InvalidUriVariableKindSubtypeInteger {
-    Type,
+    BelowMinimum(Minimum<T>),
+    AboveMaximum(Maximum<T>),
+    NotMultipleOf(U),
 }
 
 #[derive(Debug)]
 pub enum InvalidUriVariableKindSubtypeString {
     Type,
+    MinLength { expected: u32, actual: usize },
+    MaxLength { expected: u32, actual: usize },
+    Pattern { pattern: String, string: String },
 }
 
 mod sealed {
