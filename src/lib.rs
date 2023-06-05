@@ -11,6 +11,7 @@ use std::{
     marker::PhantomData,
     num::NonZeroU64,
     ops::{BitOr, Not},
+    pin::Pin,
     rc::Rc,
     str::FromStr,
 };
@@ -80,15 +81,14 @@ where
                             uri_variables
                                 .iter()
                                 .map(|(name, schema)| {
-                                    let schema = ScalarDataSchema::try_from_data_schema(
-                                        schema,
-                                        &schema_definitions,
-                                    )
-                                    .map_err(|err| ConsumeError::UriVariable {
-                                        property: property_name.clone(),
-                                        name: name.clone(),
-                                        source: err,
-                                    })?;
+                                    let schema =
+                                        ScalarDataSchema::try_from(schema).map_err(|err| {
+                                            ConsumeError::UriVariable {
+                                                property: property_name.clone(),
+                                                name: name.clone(),
+                                                source: err,
+                                            }
+                                        })?;
 
                                     Ok(UriVariable {
                                         name: name.clone(),
@@ -438,11 +438,10 @@ pub struct ScalarDataSchema {
     subtype: Option<ScalarDataSchemaSubtype>,
 }
 
-impl ScalarDataSchema {
-    fn try_from_data_schema<DS, AS, OS>(
-        value: &DataSchema<DS, AS, OS>,
-        schema_definitions: &[SchemaDefinition],
-    ) -> Result<Self, NonScalarDataSchema> {
+impl<DS, AS, OS> TryFrom<&DataSchema<DS, AS, OS>> for ScalarDataSchema {
+    type Error = NonScalarDataSchema;
+
+    fn try_from(value: &DataSchema<DS, AS, OS>) -> Result<Self, Self::Error> {
         let DataSchema {
             attype: _,
             title: _,
@@ -468,12 +467,7 @@ impl ScalarDataSchema {
         let unit = unit.clone();
         let one_of = one_of
             .as_ref()
-            .map(|one_of| {
-                one_of
-                    .iter()
-                    .map(|schema| Self::try_from_data_schema(schema, schema_definitions))
-                    .collect()
-            })
+            .map(|one_of| one_of.iter().map(Self::try_from).collect())
             .transpose()?;
         let enumeration = enumeration.clone();
         let read_only = *read_only;
@@ -733,11 +727,14 @@ impl<T> PropertyReader<'_, T> {
                     kind: err,
                 },
             });
+            return self;
         };
-        todo!()
+
+        inner.uri_variables.push((name.into(), value));
+        self
     }
 
-    pub fn send(&self) -> Result<PropertyReaderSendFuture, PropertyReaderSendError> {
+    pub fn send(&self) -> Result<PropertyReaderSendFuture<T>, PropertyReaderSendError> {
         todo!()
     }
 
@@ -940,19 +937,20 @@ impl FromStr for Protocol {
     }
 }
 
-pub struct PropertyReaderSendFuture(
+pub struct PropertyReaderSendFuture<'a, T>(
     Result<
-        Box<dyn Future<Output = Result<reqwest::Response, reqwest::Error>>>,
+        Pin<Box<dyn Future<Output = Result<T, PropertyReaderSendFutureError>> + 'a>>,
         PropertyReaderSendFutureError,
     >,
 );
 
-impl PropertyReaderSendFuture {
+impl<'a, T: 'a> PropertyReaderSendFuture<'a, T> {
     fn new(
         form: &Form,
         base: &Option<String>,
         uri_variables: &[(String, UriVariableValue)],
         security: &StatefulSecurityScheme,
+        data_schema: &'a DataSchema<(), (), ()>,
     ) -> Self {
         // TODO: move instantiation of reqwest client upstream
         let client = reqwest::Client::new();
@@ -1019,10 +1017,53 @@ impl PropertyReaderSendFuture {
                 Method::Patch => reqwest::Method::PATCH,
             }
         });
-        let builder = client.request(method, url);
 
-        todo!()
+        let builder = client.request(method, url);
+        let builder = match security {
+            StatefulSecurityScheme::NoSecurity => builder,
+            StatefulSecurityScheme::Basic { username, password } => {
+                builder.basic_auth(username, Some(password))
+            }
+            StatefulSecurityScheme::Bearer(token) => builder.bearer_auth(token),
+        };
+
+        match &form.content_type {
+            Some(content_type) if content_type.eq_ignore_ascii_case("application/json") => Self(
+                Ok(perform_request(builder, handle_json_response, data_schema)),
+            ),
+            None => Self(Ok(perform_request(
+                builder,
+                handle_json_response,
+                data_schema,
+            ))),
+            Some(content_type) => Self(Err(PropertyReaderSendFutureError::InvalidResponse(
+                PropertyReaderSendFutureInvalidResponse::UnsupportedFormat(content_type.clone()),
+            ))),
+        }
     }
+}
+
+fn perform_request<'a, T, F, Fut>(
+    builder: reqwest::RequestBuilder,
+    response_handler: F,
+    data_schema: &'a DataSchema<(), (), ()>,
+) -> Pin<Box<dyn Future<Output = Result<T, PropertyReaderSendFutureError>> + 'a>>
+where
+    F: 'a + FnOnce(reqwest::Response, &'a DataSchema<(), (), ()>) -> Fut,
+    Fut: 'a + Future<Output = Result<T, PropertyReaderSendFutureInvalidResponse>>,
+{
+    Box::pin(async move {
+        let response = builder
+            .send()
+            .await
+            .map_err(PropertyReaderSendFutureError::RequestError)?
+            .error_for_status()
+            .map_err(PropertyReaderSendFutureError::ResponseError)?;
+
+        response_handler(response, data_schema)
+            .await
+            .map_err(PropertyReaderSendFutureError::InvalidResponse)
+    })
 }
 
 #[derive(Debug)]
@@ -1048,12 +1089,78 @@ pub enum PropertyReaderSendFutureError {
         href: String,
         source: url::ParseError,
     },
+    InvalidResponse(PropertyReaderSendFutureInvalidResponse),
+    RequestError(reqwest::Error),
+    ResponseError(reqwest::Error),
+}
+
+#[derive(Debug)]
+pub enum PropertyReaderSendFutureInvalidResponse {
+    Json(HandleJsonResponseError),
+    UnsupportedFormat(String),
+}
+
+#[inline]
+async fn handle_json_response<T>(
+    response: reqwest::Response,
+    data_schema: &DataSchema<(), (), ()>,
+) -> Result<T, PropertyReaderSendFutureInvalidResponse> {
+    handle_json_response_inner(response, data_schema)
+        .await
+        .map_err(PropertyReaderSendFutureInvalidResponse::Json)
+}
+
+async fn handle_json_response_inner<T>(
+    response: reqwest::Response,
+    data_schema: &DataSchema<(), (), ()>,
+) -> Result<T, HandleJsonResponseError> {
+    let data: serde_json::Value = response
+        .json()
+        .await
+        .map_err(HandleJsonResponseError::Json)?;
+
+    handle_json_response_validate(&data, data_schema)?;
+    todo!()
+}
+
+fn handle_json_response_validate(
+    response: &serde_json::Value,
+    data_schema: &DataSchema<(), (), ()>,
+) -> Result<(), HandleJsonResponseError> {
+    if data_schema.write_only {
+        return Err(HandleJsonResponseError::WriteOnly);
+    }
+
+    if let Some(constant) = &data_schema.constant {
+        if response != constant {
+            return Err(HandleJsonResponseError::Constant {
+                expected: constant.clone(),
+                found: response.clone(),
+            });
+        }
+    }
+
+    todo!()
+}
+
+#[derive(Debug)]
+pub enum HandleJsonResponseError {
+    Json(reqwest::Error),
+    WriteOnly,
+    Constant {
+        expected: serde_json::Value,
+        found: serde_json::Value,
+    },
 }
 
 fn validate_uri_variable_value(
     schema: &ScalarDataSchema,
     value: &UriVariableValue,
 ) -> Result<(), InvalidUriVariableKind> {
+    if schema.read_only {
+        return Err(InvalidUriVariableKind::ReadOnly);
+    }
+
     if let Some(constant) = &schema.constant {
         if value != constant {
             return Err(InvalidUriVariableKind::Constant(constant.clone()));
@@ -1240,7 +1347,18 @@ fn validate_uri_variable_value(
         }
     }
 
-    todo!()
+    match &schema.one_of {
+        Some(one_of) => {
+            for schema in one_of {
+                if validate_uri_variable_value(schema, value).is_ok() {
+                    return Ok(());
+                }
+            }
+
+            Err(InvalidUriVariableKind::OneOf)
+        }
+        None => Ok(()),
+    }
 }
 
 fn is_above_minimum<T>(value: &T, minimum: &Minimum<T>) -> bool
@@ -1268,6 +1386,8 @@ pub enum InvalidUriVariableKind {
     Constant(serde_json::Value),
     Enumeration(Vec<serde_json::Value>),
     Subtype(InvalidUriVariableKindSubtype),
+    ReadOnly,
+    OneOf,
 }
 
 #[derive(Debug)]
