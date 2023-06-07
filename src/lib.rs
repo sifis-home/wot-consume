@@ -1140,7 +1140,74 @@ fn handle_json_response_validate(
         }
     }
 
-    todo!()
+    if let Some(enumeration) = &data_schema.enumeration {
+        if enumeration.iter().any(|variant| response == variant).not() {
+            return Err(HandleJsonResponseError::Enumeration {
+                expected: enumeration.clone(),
+                found: response.clone(),
+            });
+        }
+    }
+
+    if let Some(subtype) = &data_schema.subtype {
+        use serde_json::Value;
+
+        match (subtype, response) {
+            (DataSchemaSubtype::Array(data_schema), Value::Array(response)) => {
+                if let Some(min_items) = data_schema.min_items {
+                    if u32::try_from(response.len()).map_or(false, |len| len < min_items) {
+                        return Err(HandleJsonResponseError::ArraySubtype(
+                            ArraySubtypeError::MinItems {
+                                expected: min_items,
+                                found: response.len(),
+                            },
+                        ));
+                    }
+                }
+
+                if let Some(max_items) = data_schema.max_items {
+                    if u32::try_from(response.len()).map_or(true, |len| len > max_items) {
+                        return Err(HandleJsonResponseError::ArraySubtype(
+                            ArraySubtypeError::MaxItems {
+                                expected: max_items,
+                                found: response.len(),
+                            },
+                        ));
+                    }
+                }
+
+                if let Some(items) = &data_schema.items {}
+            }
+            (DataSchemaSubtype::Boolean, Value::Bool(_)) => todo!(),
+            (DataSchemaSubtype::Number(data_schema), Value::Number(response)) => todo!(),
+            (DataSchemaSubtype::Integer(data_schema), Value::Number(response)) => todo!(),
+            (DataSchemaSubtype::Object(data_schema), Value::Object(response)) => todo!(),
+            (DataSchemaSubtype::String(data_schema), Value::String(response)) => todo!(),
+            (DataSchemaSubtype::Null, Value::Null) => todo!(),
+            _ => {
+                return Err(HandleJsonResponseError::Subtype {
+                    expected: subtype.into(),
+                    found: response.clone(),
+                })
+            }
+        }
+    }
+
+    match &data_schema.one_of {
+        Some(one_of) => {
+            for schema in one_of {
+                if handle_json_response_validate(response, data_schema).is_ok() {
+                    return Ok(());
+                }
+            }
+
+            Err(HandleJsonResponseError::OneOf {
+                expected: one_of.clone(),
+                found: response.clone(),
+            })
+        }
+        None => Ok(()),
+    }
 }
 
 #[derive(Debug)]
@@ -1151,6 +1218,25 @@ pub enum HandleJsonResponseError {
         expected: serde_json::Value,
         found: serde_json::Value,
     },
+    Enumeration {
+        expected: Vec<serde_json::Value>,
+        found: serde_json::Value,
+    },
+    OneOf {
+        expected: Vec<DataSchema<(), (), ()>>,
+        found: serde_json::Value,
+    },
+    Subtype {
+        expected: DataSchemaStatelessSubtype,
+        found: serde_json::Value,
+    },
+    ArraySubtype(ArraySubtypeError),
+}
+
+#[derive(Debug)]
+pub enum ArraySubtypeError {
+    MinItems { expected: u32, found: usize },
+    MaxItems { expected: u32, found: usize },
 }
 
 fn validate_uri_variable_value(
@@ -1413,6 +1499,48 @@ pub enum InvalidUriVariableKindSubtypeString {
     MinLength { expected: u32, actual: usize },
     MaxLength { expected: u32, actual: usize },
     Pattern { pattern: String, string: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DataSchemaStatelessSubtype {
+    Array,
+    Boolean,
+    Number,
+    Integer,
+    Object,
+    String,
+    Null,
+}
+
+impl<DS, AS, OS> From<&DataSchemaSubtype<DS, AS, OS>> for DataSchemaStatelessSubtype {
+    #[inline]
+    fn from(value: &DataSchemaSubtype<DS, AS, OS>) -> Self {
+        match value {
+            DataSchemaSubtype::Array(_) => Self::Array,
+            DataSchemaSubtype::Boolean => Self::Boolean,
+            DataSchemaSubtype::Number(_) => Self::Number,
+            DataSchemaSubtype::Integer(_) => Self::Integer,
+            DataSchemaSubtype::Object(_) => Self::Object,
+            DataSchemaSubtype::String(_) => Self::String,
+            DataSchemaSubtype::Null => Self::Null,
+        }
+    }
+}
+
+impl From<&serde_json::Value> for DataSchemaStatelessSubtype {
+    #[inline]
+    fn from(value: &serde_json::Value) -> Self {
+        use serde_json::Value;
+
+        match value {
+            Value::Array(_) => Self::Array,
+            Value::Null => Self::Null,
+            Value::Bool(_) => Self::Boolean,
+            Value::Number(_) => Self::Number,
+            Value::String(_) => Self::String,
+            Value::Object(_) => Self::Object,
+        }
+    }
 }
 
 mod sealed {
