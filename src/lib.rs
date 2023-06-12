@@ -5,6 +5,7 @@
 mod data_schema_validator;
 
 use std::{
+    array,
     convert::identity,
     fmt::{self, Display},
     future::Future,
@@ -20,14 +21,15 @@ use bitflags::bitflags;
 use regex::Regex;
 use reqwest::Url;
 use sealed::HasHttpProtocolExtension;
+use smallvec::{smallvec, SmallVec};
 use tracing::warn;
 use wot_td::{
     extend::ExtendableThing,
     protocol::http,
     thing::{
-        self, ArraySchema, DataSchema, DataSchemaSubtype, DefaultedFormOperations, FormOperation,
-        IntegerSchema, InteractionAffordance, Maximum, Minimum, NumberSchema, ObjectSchema,
-        PropertyAffordance, StringSchema,
+        self, ArraySchema, BoxedElemOrVec, DataSchema, DataSchemaSubtype, DefaultedFormOperations,
+        FormOperation, IntegerSchema, InteractionAffordance, Maximum, Minimum, NumberSchema,
+        ObjectSchema, PropertyAffordance, StringSchema,
     },
     Thing,
 };
@@ -594,7 +596,7 @@ fn data_schema_subtype_without_extensions<DS, AS, OS>(
 
             let items = items
                 .as_ref()
-                .map(|items| items.iter().map(data_schema_without_extensions).collect());
+                .map(|items| items.to_ref().map(data_schema_without_extensions));
             let min_items = *min_items;
             let max_items = *max_items;
 
@@ -1123,14 +1125,94 @@ async fn handle_json_response_inner<T>(
     todo!()
 }
 
+struct ResponseValidatorState<'a> {
+    responses: &'a [serde_json::Value],
+    or_branch: ResponseValidatorOrBranch<'a>,
+    logic: ResponseValidatorLogic,
+}
+
 fn handle_json_response_validate(
     response: &serde_json::Value,
     data_schema: &DataSchema<(), (), ()>,
 ) -> Result<(), HandleJsonResponseError> {
-    if data_schema.write_only {
-        return Err(HandleJsonResponseError::WriteOnly);
+    let responses = array::from_ref(response).as_slice();
+    let mut queue: SmallVec<[_; 4]> = smallvec![ResponseValidatorState {
+        responses,
+        or_branch: ResponseValidatorOrBranch::Unchecked(data_schema),
+        logic: ResponseValidatorLogic::And,
+    }];
+
+    while let Some(ResponseValidatorState {
+        responses,
+        or_branch,
+        logic,
+    }) = queue.pop()
+    {
+        match or_branch {
+            ResponseValidatorOrBranch::Unchecked(data_schema) => {
+                if data_schema.write_only {
+                    return Err(HandleJsonResponseError::WriteOnly);
+                }
+
+                responses.iter().try_fold(0, |child_index, response| {
+                    handle_json_response_validate_impl(response, data_schema, &mut queue)
+                        .map(|()| child_index + 1)
+                })?;
+
+                if let Some(one_of) = &data_schema.one_of {
+                    queue.push(ResponseValidatorState {
+                        responses,
+                        or_branch: ResponseValidatorOrBranch::UnevaluatedOneOf(one_of),
+                        logic,
+                    });
+
+                    todo!()
+                }
+            }
+
+            or_branch @ ResponseValidatorOrBranch::UnevaluatedOneOf(one_of) => {
+                *or_branch = ResponseValidatorOrBranch::EvaluatedOneOf(one_of);
+
+                todo!()
+            }
+
+            ResponseValidatorOrBranch::EvaluatedOneOf(one_of) => {
+                if let ResponseValidatorLogic::And = logic {
+                    let found = if responses.len() == 1 {
+                        responses[0].clone()
+                    } else {
+                        serde_json::Value::Array(responses.to_vec())
+                    };
+                    return Err(HandleJsonResponseError::OneOf {
+                        expected: one_of.to_vec(),
+                        found,
+                    });
+                }
+            }
+        }
     }
 
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseValidatorLogic {
+    And,
+    Or { parent: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ResponseValidatorOrBranch<'a> {
+    Unchecked(&'a DataSchema<(), (), ()>),
+    UnevaluatedOneOf(&'a [DataSchema<(), (), ()>]),
+    EvaluatedOneOf(&'a [DataSchema<(), (), ()>]),
+}
+
+fn handle_json_response_validate_impl<const N: usize>(
+    response: &serde_json::Value,
+    data_schema: &DataSchema<(), (), ()>,
+    queue: &mut SmallVec<[ResponseValidatorState<'_>; N]>,
+) -> Result<(), HandleJsonResponseError> {
     if let Some(constant) = &data_schema.constant {
         if response != constant {
             return Err(HandleJsonResponseError::Constant {
@@ -1153,30 +1235,35 @@ fn handle_json_response_validate(
         use serde_json::Value;
 
         match (subtype, response) {
-            (DataSchemaSubtype::Array(data_schema), Value::Array(response)) => {
+            (DataSchemaSubtype::Array(data_schema), Value::Array(responses)) => {
                 if let Some(min_items) = data_schema.min_items {
-                    if u32::try_from(response.len()).map_or(false, |len| len < min_items) {
+                    if u32::try_from(responses.len()).map_or(false, |len| len < min_items) {
                         return Err(HandleJsonResponseError::ArraySubtype(
                             ArraySubtypeError::MinItems {
                                 expected: min_items,
-                                found: response.len(),
+                                found: responses.len(),
                             },
                         ));
                     }
                 }
 
                 if let Some(max_items) = data_schema.max_items {
-                    if u32::try_from(response.len()).map_or(true, |len| len > max_items) {
+                    if u32::try_from(responses.len()).map_or(true, |len| len > max_items) {
                         return Err(HandleJsonResponseError::ArraySubtype(
                             ArraySubtypeError::MaxItems {
                                 expected: max_items,
-                                found: response.len(),
+                                found: responses.len(),
                             },
                         ));
                     }
                 }
 
-                if let Some(items) = &data_schema.items {}
+                if let Some(items) = &data_schema.items {
+                    match items {
+                        BoxedElemOrVec::Elem(elem) => queue.push((responses.as_slice(), elem)),
+                        BoxedElemOrVec::Vec(_) => todo!(),
+                    }
+                }
             }
             (DataSchemaSubtype::Boolean, Value::Bool(_)) => todo!(),
             (DataSchemaSubtype::Number(data_schema), Value::Number(response)) => todo!(),
@@ -1193,21 +1280,8 @@ fn handle_json_response_validate(
         }
     }
 
-    match &data_schema.one_of {
-        Some(one_of) => {
-            for schema in one_of {
-                if handle_json_response_validate(response, data_schema).is_ok() {
-                    return Ok(());
-                }
-            }
-
-            Err(HandleJsonResponseError::OneOf {
-                expected: one_of.clone(),
-                found: response.clone(),
-            })
-        }
-        None => Ok(()),
-    }
+    // one_of needs to be evaluated upstream
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1231,6 +1305,8 @@ pub enum HandleJsonResponseError {
         found: serde_json::Value,
     },
     ArraySubtype(ArraySubtypeError),
+    TooManyChildren,
+    TooDeep,
 }
 
 #[derive(Debug)]
