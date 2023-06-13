@@ -1121,62 +1121,92 @@ async fn handle_json_response_inner<T>(
         .await
         .map_err(HandleJsonResponseError::Json)?;
 
-    handle_json_response_validate(&data, data_schema)?;
+    handle_json_response_validate(&data, data_schema)
+        .map_err(HandleJsonResponseRefError::into_owned)?;
     todo!()
 }
 
 struct ResponseValidatorState<'a> {
     responses: &'a [serde_json::Value],
-    or_branch: ResponseValidatorOrBranch<'a>,
+    branching: ResponseValidatorBranching<'a>,
     logic: ResponseValidatorLogic,
 }
 
-fn handle_json_response_validate(
-    response: &serde_json::Value,
+fn handle_json_response_validate<'a>(
+    response: &'a serde_json::Value,
     data_schema: &DataSchema<(), (), ()>,
-) -> Result<(), HandleJsonResponseError> {
+) -> Result<(), HandleJsonResponseRefError<'a>> {
     let responses = array::from_ref(response).as_slice();
     let mut queue: SmallVec<[_; 4]> = smallvec![ResponseValidatorState {
         responses,
-        or_branch: ResponseValidatorOrBranch::Unchecked(data_schema),
-        logic: ResponseValidatorLogic::And,
+        branching: ResponseValidatorBranching::Unchecked(data_schema),
+        logic: ResponseValidatorLogic::And { parent: None },
     }];
 
     while let Some(ResponseValidatorState {
         responses,
-        or_branch,
+        branching,
         logic,
     }) = queue.pop()
     {
-        match or_branch {
-            ResponseValidatorOrBranch::Unchecked(data_schema) => {
+        match branching {
+            ResponseValidatorBranching::Unchecked(data_schema) => {
                 if data_schema.write_only {
-                    return Err(HandleJsonResponseError::WriteOnly);
+                    handle_response_validate_error(
+                        HandleJsonResponseRefError::WriteOnly,
+                        logic,
+                        &mut queue,
+                    )?;
+                    continue;
                 }
 
-                responses.iter().try_fold(0, |child_index, response| {
-                    handle_json_response_validate_impl(response, data_schema, &mut queue)
-                        .map(|()| child_index + 1)
-                })?;
-
+                // Push eventual one_of before other validators, in order to pop it later
                 if let Some(one_of) = &data_schema.one_of {
                     queue.push(ResponseValidatorState {
                         responses,
-                        or_branch: ResponseValidatorOrBranch::UnevaluatedOneOf(one_of),
+                        branching: ResponseValidatorBranching::UnevaluatedOneOf(one_of),
                         logic,
                     });
 
                     todo!()
                 }
+
+                // From last to first, in order to pop from the first to last
+                responses
+                    .iter()
+                    .rev()
+                    .try_for_each(|response| {
+                        handle_json_response_validate_impl(response, data_schema, &mut queue)
+                    })
+                    .or_else(|err| handle_response_validate_error(err, logic, &mut queue))?;
             }
 
-            or_branch @ ResponseValidatorOrBranch::UnevaluatedOneOf(one_of) => {
-                *or_branch = ResponseValidatorOrBranch::EvaluatedOneOf(one_of);
+            ResponseValidatorBranching::Checked {
+                data_schema,
+                and_logic,
+            } => {
+                if and_logic.not() {
+                    todo!()
+                }
+            }
 
+            ResponseValidatorBranching::UnevaluatedOneOf(one_of) => {
+                let parent = queue.len();
+                queue.push(ResponseValidatorState {
+                    responses,
+                    branching: ResponseValidatorBranching::EvaluatedOneOf(one_of),
+                    logic,
+                });
+
+                queue.extend(one_of.iter().map(|data_schema| ResponseValidatorState {
+                    responses,
+                    branching: ResponseValidatorBranching::Unchecked(data_schema),
+                    logic: ResponseValidatorLogic::Or { parent },
+                }));
                 todo!()
             }
 
-            ResponseValidatorOrBranch::EvaluatedOneOf(one_of) => {
+            ResponseValidatorBranching::EvaluatedOneOf(one_of) => {
                 if let ResponseValidatorLogic::And = logic {
                     let found = if responses.len() == 1 {
                         responses[0].clone()
@@ -1195,38 +1225,64 @@ fn handle_json_response_validate(
     Ok(())
 }
 
+fn handle_response_validate_error<'a, const N: usize>(
+    error: HandleJsonResponseRefError<'a>,
+    logic: ResponseValidatorLogic,
+    queue: &mut SmallVec<[ResponseValidatorState; N]>,
+) -> Result<(), HandleJsonResponseRefError<'a>> {
+    // TODO:
+    // if the logic is an AND, we can rempve all the elements after the parent and encapsulate the
+    // error into a new child-related error (it is necessary to evaluate this special variant). If
+    // a "checked" element with AND logic for children is reached, all checks passed and the
+    // element can be safely popped out.
+    // if the logic is an AND and there is no parent, it means that we reached the root condition
+    // and we must return the error.
+    // if the logic is an OR, it is ok to return Ok. However, then a "checked" element with OR
+    // logic for children is reached, it means that no condition has been satisfied and an error
+    // must be generated.
+    //
+    // This process needs to be evaluated recursively (without stack recursion) because we can have
+    // chained conditions, therefore we could for instance have a failed OR logic which is
+    // downstream to another OR logic and the triggered error must be initially ignored.
+    todo!()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResponseValidatorLogic {
-    And,
+    And { parent: Option<usize> },
     Or { parent: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum ResponseValidatorOrBranch<'a> {
+enum ResponseValidatorBranching<'a> {
     Unchecked(&'a DataSchema<(), (), ()>),
+    Checked {
+        data_schema: &'a DataSchema<(), (), ()>,
+        and_logic: bool,
+    },
     UnevaluatedOneOf(&'a [DataSchema<(), (), ()>]),
     EvaluatedOneOf(&'a [DataSchema<(), (), ()>]),
 }
 
-fn handle_json_response_validate_impl<const N: usize>(
-    response: &serde_json::Value,
-    data_schema: &DataSchema<(), (), ()>,
-    queue: &mut SmallVec<[ResponseValidatorState<'_>; N]>,
-) -> Result<(), HandleJsonResponseError> {
+fn handle_json_response_validate_impl<'a, const N: usize>(
+    response: &'a serde_json::Value,
+    data_schema: &'a DataSchema<(), (), ()>,
+    queue: &mut SmallVec<[ResponseValidatorState<'a>; N]>,
+) -> Result<(), HandleJsonResponseRefError<'a>> {
     if let Some(constant) = &data_schema.constant {
         if response != constant {
-            return Err(HandleJsonResponseError::Constant {
-                expected: constant.clone(),
-                found: response.clone(),
+            return Err(HandleJsonResponseRefError::Constant {
+                expected: constant,
+                found: response,
             });
         }
     }
 
     if let Some(enumeration) = &data_schema.enumeration {
         if enumeration.iter().any(|variant| response == variant).not() {
-            return Err(HandleJsonResponseError::Enumeration {
-                expected: enumeration.clone(),
-                found: response.clone(),
+            return Err(HandleJsonResponseRefError::Enumeration {
+                expected: enumeration,
+                found: response,
             });
         }
     }
@@ -1238,7 +1294,7 @@ fn handle_json_response_validate_impl<const N: usize>(
             (DataSchemaSubtype::Array(data_schema), Value::Array(responses)) => {
                 if let Some(min_items) = data_schema.min_items {
                     if u32::try_from(responses.len()).map_or(false, |len| len < min_items) {
-                        return Err(HandleJsonResponseError::ArraySubtype(
+                        return Err(HandleJsonResponseRefError::ArraySubtype(
                             ArraySubtypeError::MinItems {
                                 expected: min_items,
                                 found: responses.len(),
@@ -1249,7 +1305,7 @@ fn handle_json_response_validate_impl<const N: usize>(
 
                 if let Some(max_items) = data_schema.max_items {
                     if u32::try_from(responses.len()).map_or(true, |len| len > max_items) {
-                        return Err(HandleJsonResponseError::ArraySubtype(
+                        return Err(HandleJsonResponseRefError::ArraySubtype(
                             ArraySubtypeError::MaxItems {
                                 expected: max_items,
                                 found: responses.len(),
@@ -1260,7 +1316,11 @@ fn handle_json_response_validate_impl<const N: usize>(
 
                 if let Some(items) = &data_schema.items {
                     match items {
-                        BoxedElemOrVec::Elem(elem) => queue.push((responses.as_slice(), elem)),
+                        BoxedElemOrVec::Elem(elem) => queue.push(ResponseValidatorState {
+                            responses: responses.as_slice(),
+                            branching: ResponseValidatorBranching::Unchecked(elem.as_ref()),
+                            logic: ResponseValidatorLogic::And,
+                        }),
                         BoxedElemOrVec::Vec(_) => todo!(),
                     }
                 }
@@ -1272,9 +1332,9 @@ fn handle_json_response_validate_impl<const N: usize>(
             (DataSchemaSubtype::String(data_schema), Value::String(response)) => todo!(),
             (DataSchemaSubtype::Null, Value::Null) => todo!(),
             _ => {
-                return Err(HandleJsonResponseError::Subtype {
+                return Err(HandleJsonResponseRefError::Subtype {
                     expected: subtype.into(),
-                    found: response.clone(),
+                    found: response,
                 })
             }
         }
@@ -1307,6 +1367,59 @@ pub enum HandleJsonResponseError {
     ArraySubtype(ArraySubtypeError),
     TooManyChildren,
     TooDeep,
+}
+
+#[derive(Debug)]
+pub enum HandleJsonResponseRefError<'a> {
+    Json(reqwest::Error),
+    WriteOnly,
+    Constant {
+        expected: &'a serde_json::Value,
+        found: &'a serde_json::Value,
+    },
+    Enumeration {
+        expected: &'a [serde_json::Value],
+        found: &'a serde_json::Value,
+    },
+    OneOf {
+        expected: &'a [DataSchema<(), (), ()>],
+        found: &'a serde_json::Value,
+    },
+    Subtype {
+        expected: DataSchemaStatelessSubtype,
+        found: &'a serde_json::Value,
+    },
+    ArraySubtype(ArraySubtypeError),
+    TooManyChildren,
+    TooDeep,
+}
+
+impl HandleJsonResponseRefError<'_> {
+    pub fn into_owned(self) -> HandleJsonResponseError {
+        match self {
+            Self::Json(err) => HandleJsonResponseError::Json(err),
+            Self::WriteOnly => HandleJsonResponseError::WriteOnly,
+            Self::Constant { expected, found } => HandleJsonResponseError::Constant {
+                expected: expected.clone(),
+                found: found.clone(),
+            },
+            Self::Enumeration { expected, found } => HandleJsonResponseError::Enumeration {
+                expected: expected.to_vec(),
+                found: found.clone(),
+            },
+            Self::OneOf { expected, found } => HandleJsonResponseError::OneOf {
+                expected: expected.to_vec(),
+                found: found.clone(),
+            },
+            Self::Subtype { expected, found } => HandleJsonResponseError::Subtype {
+                expected,
+                found: found.clone(),
+            },
+            Self::ArraySubtype(err) => HandleJsonResponseError::ArraySubtype(err),
+            Self::TooManyChildren => HandleJsonResponseError::TooManyChildren,
+            Self::TooDeep => HandleJsonResponseError::TooDeep,
+        }
+    }
 }
 
 #[derive(Debug)]
