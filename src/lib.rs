@@ -10,6 +10,7 @@ use std::{
     fmt::{self, Display},
     future::Future,
     marker::PhantomData,
+    mem,
     num::NonZeroU64,
     ops::{BitOr, Not},
     pin::Pin,
@@ -1134,10 +1135,10 @@ struct ResponseValidatorState<'a> {
 
 fn handle_json_response_validate<'a>(
     response: &'a serde_json::Value,
-    data_schema: &DataSchema<(), (), ()>,
+    data_schema: &'a DataSchema<(), (), ()>,
 ) -> Result<(), HandleJsonResponseRefError<'a>> {
     let responses = array::from_ref(response).as_slice();
-    let mut queue: SmallVec<[_; 4]> = smallvec![ResponseValidatorState {
+    let mut queue: SmallVec<[_; 8]> = smallvec![ResponseValidatorState {
         responses,
         branching: ResponseValidatorBranching::Unchecked(data_schema),
         logic: ResponseValidatorLogic::And { parent: None },
@@ -1167,9 +1168,13 @@ fn handle_json_response_validate<'a>(
                         branching: ResponseValidatorBranching::UnevaluatedOneOf(one_of),
                         logic,
                     });
-
-                    todo!()
                 }
+
+                queue.push(ResponseValidatorState {
+                    responses,
+                    branching: ResponseValidatorBranching::Evaluated(data_schema),
+                    logic,
+                });
 
                 // From last to first, in order to pop from the first to last
                 responses
@@ -1181,14 +1186,7 @@ fn handle_json_response_validate<'a>(
                     .or_else(|err| handle_response_validate_error(err, logic, &mut queue))?;
             }
 
-            ResponseValidatorBranching::Checked {
-                data_schema,
-                and_logic,
-            } => {
-                if and_logic.not() {
-                    todo!()
-                }
-            }
+            ResponseValidatorBranching::Evaluated(..) => {}
 
             ResponseValidatorBranching::UnevaluatedOneOf(one_of) => {
                 let parent = queue.len();
@@ -1198,26 +1196,28 @@ fn handle_json_response_validate<'a>(
                     logic,
                 });
 
-                queue.extend(one_of.iter().map(|data_schema| ResponseValidatorState {
-                    responses,
-                    branching: ResponseValidatorBranching::Unchecked(data_schema),
-                    logic: ResponseValidatorLogic::Or { parent },
-                }));
-                todo!()
+                // From last to first, in order to perform pops from first to last
+                queue.extend(
+                    one_of
+                        .iter()
+                        .rev()
+                        .map(|data_schema| ResponseValidatorState {
+                            responses,
+                            branching: ResponseValidatorBranching::Unchecked(data_schema),
+                            logic: ResponseValidatorLogic::Or { parent },
+                        }),
+                );
             }
 
             ResponseValidatorBranching::EvaluatedOneOf(one_of) => {
-                if let ResponseValidatorLogic::And = logic {
-                    let found = if responses.len() == 1 {
-                        responses[0].clone()
-                    } else {
-                        serde_json::Value::Array(responses.to_vec())
-                    };
-                    return Err(HandleJsonResponseError::OneOf {
-                        expected: one_of.to_vec(),
-                        found,
-                    });
-                }
+                handle_response_validate_error(
+                    HandleJsonResponseRefError::OneOf {
+                        expected: one_of,
+                        found: response,
+                    },
+                    logic,
+                    &mut queue,
+                )?;
             }
         }
     }
@@ -1227,24 +1227,23 @@ fn handle_json_response_validate<'a>(
 
 fn handle_response_validate_error<'a, const N: usize>(
     error: HandleJsonResponseRefError<'a>,
-    logic: ResponseValidatorLogic,
+    mut logic: ResponseValidatorLogic,
     queue: &mut SmallVec<[ResponseValidatorState; N]>,
 ) -> Result<(), HandleJsonResponseRefError<'a>> {
-    // TODO:
-    // if the logic is an AND, we can rempve all the elements after the parent and encapsulate the
-    // error into a new child-related error (it is necessary to evaluate this special variant). If
-    // a "checked" element with AND logic for children is reached, all checks passed and the
-    // element can be safely popped out.
-    // if the logic is an AND and there is no parent, it means that we reached the root condition
-    // and we must return the error.
-    // if the logic is an OR, it is ok to return Ok. However, then a "checked" element with OR
-    // logic for children is reached, it means that no condition has been satisfied and an error
-    // must be generated.
-    //
-    // This process needs to be evaluated recursively (without stack recursion) because we can have
-    // chained conditions, therefore we could for instance have a failed OR logic which is
-    // downstream to another OR logic and the triggered error must be initially ignored.
-    todo!()
+    loop {
+        match logic {
+            ResponseValidatorLogic::Or { .. } => break Ok(()),
+            ResponseValidatorLogic::And { parent: None } => break Err(error),
+            ResponseValidatorLogic::And {
+                parent: Some(parent),
+            } => {
+                // TODO: find a way to create an error chain to give useful information to the user
+                // without sacrificing performances
+                logic = queue[parent].logic;
+                queue.truncate(parent);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1256,10 +1255,7 @@ enum ResponseValidatorLogic {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ResponseValidatorBranching<'a> {
     Unchecked(&'a DataSchema<(), (), ()>),
-    Checked {
-        data_schema: &'a DataSchema<(), (), ()>,
-        and_logic: bool,
-    },
+    Evaluated(&'a DataSchema<(), (), ()>),
     UnevaluatedOneOf(&'a [DataSchema<(), (), ()>]),
     EvaluatedOneOf(&'a [DataSchema<(), (), ()>]),
 }
@@ -1287,10 +1283,21 @@ fn handle_json_response_validate_impl<'a, const N: usize>(
         }
     }
 
+    let parent = queue.len() - 1;
+    debug_assert!(matches!(
+        queue[parent].branching,
+        ResponseValidatorBranching::Evaluated(queue_data_schema)
+        if std::ptr::eq(queue_data_schema, data_schema)
+    ));
+    let parent = Some(parent);
+
     if let Some(subtype) = &data_schema.subtype {
         use serde_json::Value;
 
         match (subtype, response) {
+            (DataSchemaSubtype::Boolean, Value::Bool(_))
+            | (DataSchemaSubtype::Null, Value::Null) => {}
+
             (DataSchemaSubtype::Array(data_schema), Value::Array(responses)) => {
                 if let Some(min_items) = data_schema.min_items {
                     if u32::try_from(responses.len()).map_or(false, |len| len < min_items) {
@@ -1319,18 +1326,91 @@ fn handle_json_response_validate_impl<'a, const N: usize>(
                         BoxedElemOrVec::Elem(elem) => queue.push(ResponseValidatorState {
                             responses: responses.as_slice(),
                             branching: ResponseValidatorBranching::Unchecked(elem.as_ref()),
-                            logic: ResponseValidatorLogic::And,
+                            logic: ResponseValidatorLogic::And { parent },
                         }),
-                        BoxedElemOrVec::Vec(_) => todo!(),
+                        BoxedElemOrVec::Vec(data_schemas) => {
+                            if data_schemas.len() != responses.len() {
+                                return Err(HandleJsonResponseRefError::ArraySubtype(
+                                    ArraySubtypeError::Length {
+                                        expected: data_schemas.len(),
+                                        found: responses.len(),
+                                    },
+                                ));
+                            }
+
+                            queue.extend(data_schemas.iter().zip(responses.iter()).rev().map(
+                                |(data_schema, response)| ResponseValidatorState {
+                                    responses: array::from_ref(response).as_slice(),
+                                    branching: ResponseValidatorBranching::Unchecked(data_schema),
+                                    logic: ResponseValidatorLogic::And { parent },
+                                },
+                            ));
+                        }
                     }
                 }
             }
-            (DataSchemaSubtype::Boolean, Value::Bool(_)) => todo!(),
-            (DataSchemaSubtype::Number(data_schema), Value::Number(response)) => todo!(),
-            (DataSchemaSubtype::Integer(data_schema), Value::Number(response)) => todo!(),
-            (DataSchemaSubtype::Object(data_schema), Value::Object(response)) => todo!(),
+
+            (DataSchemaSubtype::Number(data_schema), Value::Number(response)) => {
+                let Some(value) = response.as_f64() else {
+                    return Err(HandleJsonResponseRefError::NumberSubtype(
+                        NumberSubtypeError::InvalidType(response.clone()),
+                    ));
+                };
+
+                check_number(data_schema, value).map_err(|err| HandleJsonResponseRefError::NumberSubtype(err.into()))?;
+            }
+            (DataSchemaSubtype::Integer(data_schema), Value::Number(response)) => {
+                let Some(value) = response.as_i64() else {
+                    return Err(HandleJsonResponseRefError::IntegerSubtype(
+                        IntegerSubtypeError::InvalidType(response.clone()),
+                    ));
+                };
+
+                if let Some(minimum) = data_schema.minimum {
+                    if is_above_minimum(&value, &minimum).not() {
+                        return Err(HandleJsonResponseRefError::IntegerSubtype(
+                            IntegerSubtypeError::Minimum {
+                                expected: minimum,
+                                found: value,
+                            },
+                        ));
+                    }
+                }
+
+                if let Some(maximum) = data_schema.maximum {
+                    if is_below_maximum(&value, &maximum).not() {
+                        return Err(HandleJsonResponseRefError::IntegerSubtype(
+                            IntegerSubtypeError::Maximum {
+                                expected: maximum,
+                                found: value,
+                            },
+                        ));
+                    }
+                }
+
+                if let Some(multiple_of) = data_schema.multiple_of {
+                    // Reasoning: if the value of `multiply_of` is above i64::MAX, the value cannot
+                    // be a multiple of that. Otherwise we check the modulo, and because we only
+                    // need to check whether it is zero or not, it does not matter if we use the
+                    // truncated (%) or the euclidean form.
+                    let is_multiple_of = i64::try_from(multiple_of.get())
+                        .ok()
+                        .map_or(false, |multiple_of| value % multiple_of == 0);
+
+                    if is_multiple_of.not() {
+                        return Err(HandleJsonResponseRefError::IntegerSubtype(
+                            IntegerSubtypeError::MultipleOf {
+                                expected: multiple_of,
+                                found: value,
+                            },
+                        ));
+                    }
+                }
+            }
+
             (DataSchemaSubtype::String(data_schema), Value::String(response)) => todo!(),
-            (DataSchemaSubtype::Null, Value::Null) => todo!(),
+
+            (DataSchemaSubtype::Object(data_schema), Value::Object(response)) => todo!(),
             _ => {
                 return Err(HandleJsonResponseRefError::Subtype {
                     expected: subtype.into(),
@@ -1340,7 +1420,7 @@ fn handle_json_response_validate_impl<'a, const N: usize>(
         }
     }
 
-    // one_of needs to be evaluated upstream
+    // one_of needs to be handled upstream
     Ok(())
 }
 
@@ -1365,6 +1445,7 @@ pub enum HandleJsonResponseError {
         found: serde_json::Value,
     },
     ArraySubtype(ArraySubtypeError),
+    NumberSubtype(NumberSubtypeError),
     TooManyChildren,
     TooDeep,
 }
@@ -1390,6 +1471,8 @@ pub enum HandleJsonResponseRefError<'a> {
         found: &'a serde_json::Value,
     },
     ArraySubtype(ArraySubtypeError),
+    NumberSubtype(NumberSubtypeError),
+    IntegerSubtype(IntegerSubtypeError),
     TooManyChildren,
     TooDeep,
 }
@@ -1426,6 +1509,33 @@ impl HandleJsonResponseRefError<'_> {
 pub enum ArraySubtypeError {
     MinItems { expected: u32, found: usize },
     MaxItems { expected: u32, found: usize },
+    Length { expected: usize, found: usize },
+}
+
+#[derive(Debug)]
+pub enum NumberSubtypeError {
+    InvalidType(serde_json::Number),
+    Minimum { expected: Minimum<f64>, found: f64 },
+    Maximum { expected: Maximum<f64>, found: f64 },
+    MultipleOf { expected: f64, found: f64 },
+}
+
+impl From<CheckNumberError> for NumberSubtypeError {
+    fn from(value: CheckNumberError) -> Self {
+        match value {
+            CheckNumberError::Minimum { expected, found } => Self::Minimum { expected, found }
+            CheckNumberError::Maximum { expected, found } => Self::Maximum { expected, found }
+            CheckNumberError::MultipleOf{ expected, found } => Self::MultipleOf { expected, found }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum IntegerSubtypeError {
+    InvalidType(serde_json::Number),
+    Minimum { expected: Minimum<i64>, found: i64 },
+    Maximum { expected: Maximum<i64>, found: i64 },
+    MultipleOf { expected: NonZeroU64, found: i64 },
 }
 
 fn validate_uri_variable_value(
@@ -1730,6 +1840,50 @@ impl From<&serde_json::Value> for DataSchemaStatelessSubtype {
             Value::Object(_) => Self::Object,
         }
     }
+}
+
+fn check_number(data_schema: &NumberSchema, value: f64) -> Result<(), CheckNumberError> {
+    if let Some(minimum) = data_schema.minimum {
+        if is_above_minimum(&value, &minimum).not() {
+            return Err(CheckNumberError::Minimum {
+                expected: minimum,
+                found: value,
+            });
+        }
+    }
+
+    if let Some(maximum) = data_schema.maximum {
+        if is_below_maximum(&value, &maximum).not() {
+            return Err(CheckNumberError::Maximum {
+                expected: maximum,
+                found: value,
+            });
+        }
+    }
+
+    if let Some(multiple_of) = data_schema.multiple_of {
+        // We should **never** get `multiple_of` less or equal than 0, this condition
+        // should be checked during the deserialization of the TD. If this prerequisite
+        // is not satisfied, we just consider the multiplicative constraint not
+        // satisfied.
+        let is_multiple_of = multiple_of > 0. && f64::abs(value % multiple_of) < f64::EPSILON;
+
+        if is_multiple_of.not() {
+            return Err(CheckNumberError::MultipleOf {
+                expected: multiple_of,
+                found: value,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Debug)]
+enum CheckNumberError {
+    Minimum { expected: Minimum<f64>, found: f64 },
+    Maximum { expected: Maximum<f64>, found: f64 },
+    MultipleOf { expected: f64, found: f64 },
 }
 
 mod sealed {
