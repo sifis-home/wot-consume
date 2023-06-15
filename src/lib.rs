@@ -737,7 +737,12 @@ impl<T> PropertyReader<'_, T> {
         self
     }
 
-    pub fn send(&self) -> Result<PropertyReaderSendFuture<T>, PropertyReaderSendError> {
+    pub fn send(&self) -> Result<PropertyReaderSendFuture<T>, PropertyReaderSendError<'_>> {
+        let status = self
+            .status
+            .as_ref()
+            .map_err(|err| PropertyReaderSendError::PropertyReader(err.clone()))?;
+
         todo!()
     }
 
@@ -857,13 +862,13 @@ impl<T> PartialVecRefs<'_, T> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PropertyReaderError<'a> {
     property: &'a Property,
     pub kind: PropertyReaderErrorKind,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum PropertyReaderErrorKind {
     UnavailableSecurityScheme(ReaderSecurityScheme),
     UnavailableProtocols,
@@ -940,11 +945,11 @@ impl FromStr for Protocol {
     }
 }
 
+type PropertyReaderSendFutureInner<'a, T> =
+    dyn Future<Output = Result<T, PropertyReaderSendFutureError>> + 'a;
+
 pub struct PropertyReaderSendFuture<'a, T>(
-    Result<
-        Pin<Box<dyn Future<Output = Result<T, PropertyReaderSendFutureError>> + 'a>>,
-        PropertyReaderSendFutureError,
-    >,
+    Result<Pin<Box<PropertyReaderSendFutureInner<'a, T>>>, PropertyReaderSendFutureError>,
 );
 
 impl<'a, T: 'a> PropertyReaderSendFuture<'a, T> {
@@ -1329,15 +1334,13 @@ fn handle_json_response_validate_impl<'a, const N: usize>(
                             logic: ResponseValidatorLogic::And { parent },
                         }),
                         BoxedElemOrVec::Vec(data_schemas) => {
-                            if data_schemas.len() != responses.len() {
-                                return Err(HandleJsonResponseRefError::ArraySubtype(
-                                    ArraySubtypeError::Length {
-                                        expected: data_schemas.len(),
-                                        found: responses.len(),
-                                    },
-                                ));
-                            }
-
+                            // Note: we can have a different number of responses and data schemas.
+                            //
+                            // If the number of responses is less than the data schemas, it is ok
+                            // (unless against min_items). Moreover, we can have more responses
+                            // than data schemas: we MUST not validate the additional elements
+                            // according to the spec. In fact, we have to handle the validation
+                            // like `items: true` in 2020-12 JSON schema draft.
                             queue.extend(data_schemas.iter().zip(responses.iter()).rev().map(
                                 |(data_schema, response)| ResponseValidatorState {
                                     responses: array::from_ref(response).as_slice(),
@@ -1353,64 +1356,61 @@ fn handle_json_response_validate_impl<'a, const N: usize>(
             (DataSchemaSubtype::Number(data_schema), Value::Number(response)) => {
                 let Some(value) = response.as_f64() else {
                     return Err(HandleJsonResponseRefError::NumberSubtype(
-                        NumberSubtypeError::InvalidType(response.clone()),
+                        NumericSubtypeError::InvalidType(response.clone()),
                     ));
                 };
 
-                check_number(data_schema, value).map_err(|err| HandleJsonResponseRefError::NumberSubtype(err.into()))?;
+                check_number(data_schema, value)
+                    .map_err(|err| HandleJsonResponseRefError::NumberSubtype(err.into()))?;
             }
             (DataSchemaSubtype::Integer(data_schema), Value::Number(response)) => {
                 let Some(value) = response.as_i64() else {
                     return Err(HandleJsonResponseRefError::IntegerSubtype(
-                        IntegerSubtypeError::InvalidType(response.clone()),
+                        NumericSubtypeError::InvalidType(response.clone()),
                     ));
                 };
 
-                if let Some(minimum) = data_schema.minimum {
-                    if is_above_minimum(&value, &minimum).not() {
-                        return Err(HandleJsonResponseRefError::IntegerSubtype(
-                            IntegerSubtypeError::Minimum {
-                                expected: minimum,
-                                found: value,
+                check_integer(data_schema, value)
+                    .map_err(|err| HandleJsonResponseRefError::IntegerSubtype(err.into()))?;
+            }
+
+            (DataSchemaSubtype::String(data_schema), Value::String(response)) => {
+                check_string(data_schema, response)
+                    .map_err(|err| HandleJsonResponseRefError::StringSubtype(err.into()))?;
+            }
+
+            (DataSchemaSubtype::Object(data_schema), Value::Object(response)) => {
+                if let Some(required) = &data_schema.required {
+                    if required
+                        .iter()
+                        .all(|required| response.contains_key(required))
+                        .not()
+                    {
+                        return Err(HandleJsonResponseRefError::ObjectSubtype(
+                            ObjectSubtypeRefError::MissingRequired {
+                                required,
+                                data: response,
                             },
                         ));
                     }
                 }
 
-                if let Some(maximum) = data_schema.maximum {
-                    if is_below_maximum(&value, &maximum).not() {
-                        return Err(HandleJsonResponseRefError::IntegerSubtype(
-                            IntegerSubtypeError::Maximum {
-                                expected: maximum,
-                                found: value,
-                            },
-                        ));
-                    }
-                }
-
-                if let Some(multiple_of) = data_schema.multiple_of {
-                    // Reasoning: if the value of `multiply_of` is above i64::MAX, the value cannot
-                    // be a multiple of that. Otherwise we check the modulo, and because we only
-                    // need to check whether it is zero or not, it does not matter if we use the
-                    // truncated (%) or the euclidean form.
-                    let is_multiple_of = i64::try_from(multiple_of.get())
-                        .ok()
-                        .map_or(false, |multiple_of| value % multiple_of == 0);
-
-                    if is_multiple_of.not() {
-                        return Err(HandleJsonResponseRefError::IntegerSubtype(
-                            IntegerSubtypeError::MultipleOf {
-                                expected: multiple_of,
-                                found: value,
-                            },
-                        ));
-                    }
+                if let Some(properties) = &data_schema.properties {
+                    queue.extend(
+                        response
+                            .iter()
+                            .filter_map(|(name, response)| {
+                                properties.get(name).map(|property| (response, property))
+                            })
+                            .map(|(response, property)| ResponseValidatorState {
+                                responses: array::from_ref(response).as_slice(),
+                                branching: ResponseValidatorBranching::Unchecked(property),
+                                logic: ResponseValidatorLogic::And { parent },
+                            }),
+                    );
                 }
             }
 
-            (DataSchemaSubtype::String(data_schema), Value::String(response)) => todo!(),
-
-            (DataSchemaSubtype::Object(data_schema), Value::Object(response)) => todo!(),
             _ => {
                 return Err(HandleJsonResponseRefError::Subtype {
                     expected: subtype.into(),
@@ -1445,7 +1445,10 @@ pub enum HandleJsonResponseError {
         found: serde_json::Value,
     },
     ArraySubtype(ArraySubtypeError),
-    NumberSubtype(NumberSubtypeError),
+    NumberSubtype(NumericSubtypeError<f64, f64>),
+    IntegerSubtype(NumericSubtypeError<i64, NonZeroU64>),
+    StringSubtype(StringSubtypeError),
+    ObjectSubtype(ObjectSubtypeError),
     TooManyChildren,
     TooDeep,
 }
@@ -1471,8 +1474,10 @@ pub enum HandleJsonResponseRefError<'a> {
         found: &'a serde_json::Value,
     },
     ArraySubtype(ArraySubtypeError),
-    NumberSubtype(NumberSubtypeError),
-    IntegerSubtype(IntegerSubtypeError),
+    NumberSubtype(NumericSubtypeError<f64, f64>),
+    IntegerSubtype(NumericSubtypeError<i64, NonZeroU64>),
+    StringSubtype(StringSubtypeRefError<'a>),
+    ObjectSubtype(ObjectSubtypeRefError<'a>),
     TooManyChildren,
     TooDeep,
 }
@@ -1499,6 +1504,10 @@ impl HandleJsonResponseRefError<'_> {
                 found: found.clone(),
             },
             Self::ArraySubtype(err) => HandleJsonResponseError::ArraySubtype(err),
+            Self::NumberSubtype(err) => HandleJsonResponseError::NumberSubtype(err),
+            Self::IntegerSubtype(err) => HandleJsonResponseError::IntegerSubtype(err),
+            Self::StringSubtype(err) => HandleJsonResponseError::StringSubtype(err.into()),
+            Self::ObjectSubtype(err) => HandleJsonResponseError::ObjectSubtype(err.into()),
             Self::TooManyChildren => HandleJsonResponseError::TooManyChildren,
             Self::TooDeep => HandleJsonResponseError::TooDeep,
         }
@@ -1509,33 +1518,99 @@ impl HandleJsonResponseRefError<'_> {
 pub enum ArraySubtypeError {
     MinItems { expected: u32, found: usize },
     MaxItems { expected: u32, found: usize },
-    Length { expected: usize, found: usize },
 }
 
 #[derive(Debug)]
-pub enum NumberSubtypeError {
+pub enum NumericSubtypeError<T, U> {
     InvalidType(serde_json::Number),
-    Minimum { expected: Minimum<f64>, found: f64 },
-    Maximum { expected: Maximum<f64>, found: f64 },
-    MultipleOf { expected: f64, found: f64 },
+    Minimum { expected: Minimum<T>, found: T },
+    Maximum { expected: Maximum<T>, found: T },
+    MultipleOf { expected: U, found: T },
 }
 
-impl From<CheckNumberError> for NumberSubtypeError {
-    fn from(value: CheckNumberError) -> Self {
+impl<T, U> From<CheckNumericError<T, U>> for NumericSubtypeError<T, U> {
+    fn from(value: CheckNumericError<T, U>) -> Self {
         match value {
-            CheckNumberError::Minimum { expected, found } => Self::Minimum { expected, found }
-            CheckNumberError::Maximum { expected, found } => Self::Maximum { expected, found }
-            CheckNumberError::MultipleOf{ expected, found } => Self::MultipleOf { expected, found }
+            CheckNumericError::Minimum { expected, found } => Self::Minimum { expected, found },
+            CheckNumericError::Maximum { expected, found } => Self::Maximum { expected, found },
+            CheckNumericError::MultipleOf { expected, found } => {
+                Self::MultipleOf { expected, found }
+            }
         }
     }
 }
 
 #[derive(Debug)]
-pub enum IntegerSubtypeError {
-    InvalidType(serde_json::Number),
-    Minimum { expected: Minimum<i64>, found: i64 },
-    Maximum { expected: Maximum<i64>, found: i64 },
-    MultipleOf { expected: NonZeroU64, found: i64 },
+pub enum StringSubtypeRefError<'a> {
+    MinLength { expected: u32, actual: usize },
+    MaxLength { expected: u32, actual: usize },
+    Pattern { pattern: &'a str, string: &'a str },
+}
+
+impl<'a> From<CheckStringError<'a>> for StringSubtypeRefError<'a> {
+    fn from(value: CheckStringError<'a>) -> Self {
+        match value {
+            CheckStringError::MinLength { expected, actual } => {
+                Self::MinLength { expected, actual }
+            }
+            CheckStringError::MaxLength { expected, actual } => {
+                Self::MaxLength { expected, actual }
+            }
+            CheckStringError::Pattern { pattern, string } => Self::Pattern { pattern, string },
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum StringSubtypeError {
+    MinLength { expected: u32, actual: usize },
+    MaxLength { expected: u32, actual: usize },
+    Pattern { pattern: String, string: String },
+}
+
+impl From<StringSubtypeRefError<'_>> for StringSubtypeError {
+    fn from(value: StringSubtypeRefError<'_>) -> Self {
+        match value {
+            StringSubtypeRefError::MinLength { expected, actual } => {
+                Self::MinLength { expected, actual }
+            }
+            StringSubtypeRefError::MaxLength { expected, actual } => {
+                Self::MaxLength { expected, actual }
+            }
+            StringSubtypeRefError::Pattern { pattern, string } => Self::Pattern {
+                pattern: pattern.to_owned(),
+                string: string.to_owned(),
+            },
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum ObjectSubtypeRefError<'a> {
+    MissingRequired {
+        required: &'a [String],
+        data: &'a serde_json::Map<String, serde_json::Value>,
+    },
+}
+
+#[derive(Debug)]
+pub enum ObjectSubtypeError {
+    MissingRequired(Vec<String>),
+}
+
+impl From<ObjectSubtypeRefError<'_>> for ObjectSubtypeError {
+    fn from(value: ObjectSubtypeRefError<'_>) -> Self {
+        match value {
+            ObjectSubtypeRefError::MissingRequired { required, data } => {
+                let missing = required
+                    .iter()
+                    .filter(|&required| data.contains_key(required).not())
+                    .cloned()
+                    .collect();
+                Self::MissingRequired(missing)
+            }
+        }
+    }
 }
 
 fn validate_uri_variable_value(
@@ -1568,7 +1643,7 @@ fn validate_uri_variable_value(
                 }
             }
             ScalarDataSchemaSubtype::Number(schema) => {
-                let UriVariableValue::Number(value) = value else {
+                let &UriVariableValue::Number(value) = value else {
                     return Err(InvalidUriVariableKind::Subtype(
                         InvalidUriVariableKindSubtype::Number(
                             InvalidUriVariableKindSubtypeNumeric::Type
@@ -1576,45 +1651,14 @@ fn validate_uri_variable_value(
                     ));
                 };
 
-                if let Some(minimum) = &schema.minimum {
-                    if is_above_minimum(value, minimum).not() {
-                        return Err(InvalidUriVariableKind::Subtype(
-                            InvalidUriVariableKindSubtype::Number(
-                                InvalidUriVariableKindSubtypeNumeric::BelowMinimum(*minimum),
-                            ),
-                        ));
-                    }
-                }
-
-                if let Some(maximum) = &schema.maximum {
-                    if is_below_maximum(value, maximum).not() {
-                        return Err(InvalidUriVariableKind::Subtype(
-                            InvalidUriVariableKindSubtype::Number(
-                                InvalidUriVariableKindSubtypeNumeric::AboveMaximum(*maximum),
-                            ),
-                        ));
-                    }
-                }
-
-                if let Some(multiple_of) = schema.multiple_of {
-                    // We should **never** get `multiple_of` less or equal than 0, this condition
-                    // should be checked during the deserialization of the TD. If this prerequisite
-                    // is not satisfied, we just consider the multiplicative constraint not
-                    // satisfied.
-                    let is_multiple_of =
-                        multiple_of > 0. && f64::abs(value % multiple_of) < f64::EPSILON;
-
-                    if is_multiple_of.not() {
-                        return Err(InvalidUriVariableKind::Subtype(
-                            InvalidUriVariableKindSubtype::Number(
-                                InvalidUriVariableKindSubtypeNumeric::NotMultipleOf(multiple_of),
-                            ),
-                        ));
-                    }
-                }
+                check_number(schema, value).map_err(|err| {
+                    InvalidUriVariableKind::Subtype(InvalidUriVariableKindSubtype::Number(
+                        err.into(),
+                    ))
+                })?;
             }
             ScalarDataSchemaSubtype::Integer(schema) => {
-                let UriVariableValue::Integer(value) = value else {
+                let &UriVariableValue::Integer(value) = value else {
                     return Err(InvalidUriVariableKind::Subtype(
                         InvalidUriVariableKindSubtype::Integer(
                             InvalidUriVariableKindSubtypeNumeric::Type
@@ -1622,43 +1666,11 @@ fn validate_uri_variable_value(
                     ));
                 };
 
-                if let Some(minimum) = &schema.minimum {
-                    if is_above_minimum(value, minimum).not() {
-                        return Err(InvalidUriVariableKind::Subtype(
-                            InvalidUriVariableKindSubtype::Integer(
-                                InvalidUriVariableKindSubtypeNumeric::BelowMinimum(*minimum),
-                            ),
-                        ));
-                    }
-                }
-
-                if let Some(maximum) = &schema.maximum {
-                    if is_below_maximum(value, maximum).not() {
-                        return Err(InvalidUriVariableKind::Subtype(
-                            InvalidUriVariableKindSubtype::Integer(
-                                InvalidUriVariableKindSubtypeNumeric::AboveMaximum(*maximum),
-                            ),
-                        ));
-                    }
-                }
-
-                if let Some(multiple_of) = schema.multiple_of {
-                    // Reasoning: if the value of `multiply_of` is above i64::MAX, the value cannot
-                    // be a multiple of that. Otherwise we check the modulo, and because we only
-                    // need to check whether it is zero or not, it does not matter if we use the
-                    // truncated (%) or the euclidean form.
-                    let is_multiple_of = i64::try_from(multiple_of.get())
-                        .ok()
-                        .map_or(false, |multiple_of| value % multiple_of == 0);
-
-                    if is_multiple_of.not() {
-                        return Err(InvalidUriVariableKind::Subtype(
-                            InvalidUriVariableKindSubtype::Integer(
-                                InvalidUriVariableKindSubtypeNumeric::NotMultipleOf(multiple_of),
-                            ),
-                        ));
-                    }
-                }
+                check_integer(schema, value).map_err(|err| {
+                    InvalidUriVariableKind::Subtype(InvalidUriVariableKindSubtype::Integer(
+                        err.into(),
+                    ))
+                })?;
             }
             ScalarDataSchemaSubtype::String(schema) => {
                 let UriVariableValue::String(value) = value else {
@@ -1669,59 +1681,11 @@ fn validate_uri_variable_value(
                     ));
                 };
 
-                if schema.content_encoding.is_some() {
-                    warn!("content encoding is still not supported");
-                }
-
-                if schema.min_length.is_some() || schema.max_length.is_some() {
-                    // Quote from the WoT-TD 1.1 spec:
-                    //
-                    // The length of a string (i.e., minLength and maxLength) is defined as the
-                    // number of Unicode code points, as defined by RFC8259.
-                    let code_points = value.chars().count();
-                    let code_points_u32 = u32::try_from(code_points);
-
-                    if let Some(min_length) = schema.min_length {
-                        if code_points_u32.map_or(true, |code_points| code_points < min_length) {
-                            return Err(InvalidUriVariableKind::Subtype(
-                                InvalidUriVariableKindSubtype::String(
-                                    InvalidUriVariableKindSubtypeString::MinLength {
-                                        expected: min_length,
-                                        actual: code_points,
-                                    },
-                                ),
-                            ));
-                        }
-                    }
-
-                    if let Some(max_length) = schema.max_length {
-                        if code_points_u32.map_or(true, |code_points| code_points > max_length) {
-                            return Err(InvalidUriVariableKind::Subtype(
-                                InvalidUriVariableKindSubtype::String(
-                                    InvalidUriVariableKindSubtypeString::MaxLength {
-                                        expected: max_length,
-                                        actual: code_points,
-                                    },
-                                ),
-                            ));
-                        }
-                    }
-                }
-
-                if let Some(pattern) = &schema.pattern {
-                    let is_valid_pattern =
-                        Regex::new(pattern).map_or(false, |regex| regex.is_match(value));
-                    if is_valid_pattern.not() {
-                        return Err(InvalidUriVariableKind::Subtype(
-                            InvalidUriVariableKindSubtype::String(
-                                InvalidUriVariableKindSubtypeString::Pattern {
-                                    pattern: pattern.clone(),
-                                    string: value.clone(),
-                                },
-                            ),
-                        ));
-                    }
-                }
+                check_string(schema, value).map_err(|err| {
+                    InvalidUriVariableKind::Subtype(InvalidUriVariableKindSubtype::String(
+                        err.into(),
+                    ))
+                })?;
             }
             ScalarDataSchemaSubtype::Null => {
                 // There is no possible way to universally represent a null uri variable.
@@ -1766,7 +1730,7 @@ where
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum InvalidUriVariableKind {
     Constant(serde_json::Value),
     Enumeration(Vec<serde_json::Value>),
@@ -1775,7 +1739,7 @@ pub enum InvalidUriVariableKind {
     OneOf,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum InvalidUriVariableKindSubtype {
     Boolean,
     Number(InvalidUriVariableKindSubtypeNumeric<f64, f64>),
@@ -1784,7 +1748,7 @@ pub enum InvalidUriVariableKindSubtype {
     Null,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum InvalidUriVariableKindSubtypeNumeric<T, U> {
     Type,
     BelowMinimum(Minimum<T>),
@@ -1792,12 +1756,39 @@ pub enum InvalidUriVariableKindSubtypeNumeric<T, U> {
     NotMultipleOf(U),
 }
 
-#[derive(Debug)]
+impl<T, U> From<CheckNumericError<T, U>> for InvalidUriVariableKindSubtypeNumeric<T, U> {
+    fn from(value: CheckNumericError<T, U>) -> Self {
+        match value {
+            CheckNumericError::Minimum { expected, .. } => Self::BelowMinimum(expected),
+            CheckNumericError::Maximum { expected, .. } => Self::AboveMaximum(expected),
+            CheckNumericError::MultipleOf { expected, .. } => Self::NotMultipleOf(expected),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub enum InvalidUriVariableKindSubtypeString {
     Type,
     MinLength { expected: u32, actual: usize },
     MaxLength { expected: u32, actual: usize },
     Pattern { pattern: String, string: String },
+}
+
+impl From<CheckStringError<'_>> for InvalidUriVariableKindSubtypeString {
+    fn from(value: CheckStringError) -> Self {
+        match value {
+            CheckStringError::MinLength { expected, actual } => {
+                Self::MinLength { expected, actual }
+            }
+            CheckStringError::MaxLength { expected, actual } => {
+                Self::MaxLength { expected, actual }
+            }
+            CheckStringError::Pattern { pattern, string } => Self::Pattern {
+                pattern: pattern.to_owned(),
+                string: string.to_owned(),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1842,10 +1833,10 @@ impl From<&serde_json::Value> for DataSchemaStatelessSubtype {
     }
 }
 
-fn check_number(data_schema: &NumberSchema, value: f64) -> Result<(), CheckNumberError> {
+fn check_number(data_schema: &NumberSchema, value: f64) -> Result<(), CheckNumericError<f64, f64>> {
     if let Some(minimum) = data_schema.minimum {
         if is_above_minimum(&value, &minimum).not() {
-            return Err(CheckNumberError::Minimum {
+            return Err(CheckNumericError::Minimum {
                 expected: minimum,
                 found: value,
             });
@@ -1854,7 +1845,7 @@ fn check_number(data_schema: &NumberSchema, value: f64) -> Result<(), CheckNumbe
 
     if let Some(maximum) = data_schema.maximum {
         if is_below_maximum(&value, &maximum).not() {
-            return Err(CheckNumberError::Maximum {
+            return Err(CheckNumericError::Maximum {
                 expected: maximum,
                 found: value,
             });
@@ -1869,7 +1860,49 @@ fn check_number(data_schema: &NumberSchema, value: f64) -> Result<(), CheckNumbe
         let is_multiple_of = multiple_of > 0. && f64::abs(value % multiple_of) < f64::EPSILON;
 
         if is_multiple_of.not() {
-            return Err(CheckNumberError::MultipleOf {
+            return Err(CheckNumericError::MultipleOf {
+                expected: multiple_of,
+                found: value,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn check_integer(
+    data_schema: &IntegerSchema,
+    value: i64,
+) -> Result<(), CheckNumericError<i64, NonZeroU64>> {
+    if let Some(minimum) = data_schema.minimum {
+        if is_above_minimum(&value, &minimum).not() {
+            return Err(CheckNumericError::Minimum {
+                expected: minimum,
+                found: value,
+            });
+        }
+    }
+
+    if let Some(maximum) = data_schema.maximum {
+        if is_below_maximum(&value, &maximum).not() {
+            return Err(CheckNumericError::Maximum {
+                expected: maximum,
+                found: value,
+            });
+        }
+    }
+
+    if let Some(multiple_of) = data_schema.multiple_of {
+        // Reasoning: if the value of `multiply_of` is above i64::MAX, the value cannot
+        // be a multiple of that. Otherwise we check the modulo, and because we only
+        // need to check whether it is zero or not, it does not matter if we use the
+        // truncated (%) or the euclidean form.
+        let is_multiple_of = i64::try_from(multiple_of.get())
+            .ok()
+            .map_or(false, |multiple_of| value % multiple_of == 0);
+
+        if is_multiple_of.not() {
+            return Err(CheckNumericError::MultipleOf {
                 expected: multiple_of,
                 found: value,
             });
@@ -1880,10 +1913,65 @@ fn check_number(data_schema: &NumberSchema, value: f64) -> Result<(), CheckNumbe
 }
 
 #[derive(Debug)]
-enum CheckNumberError {
-    Minimum { expected: Minimum<f64>, found: f64 },
-    Maximum { expected: Maximum<f64>, found: f64 },
-    MultipleOf { expected: f64, found: f64 },
+enum CheckNumericError<T, U> {
+    Minimum { expected: Minimum<T>, found: T },
+    Maximum { expected: Maximum<T>, found: T },
+    MultipleOf { expected: U, found: T },
+}
+
+fn check_string<'a>(
+    data_schema: &'a StringSchema,
+    value: &'a str,
+) -> Result<(), CheckStringError<'a>> {
+    if data_schema.content_encoding.is_some() {
+        warn!("content encoding is still not supported");
+    }
+
+    if data_schema.min_length.is_some() || data_schema.max_length.is_some() {
+        // Quote from the WoT-TD 1.1 spec:
+        //
+        // The length of a string (i.e., minLength and maxLength) is defined as the
+        // number of Unicode code points, as defined by RFC8259.
+        let code_points = value.chars().count();
+        let code_points_u32 = u32::try_from(code_points);
+
+        if let Some(min_length) = data_schema.min_length {
+            if code_points_u32.map_or(true, |code_points| code_points < min_length) {
+                return Err(CheckStringError::MinLength {
+                    expected: min_length,
+                    actual: code_points,
+                });
+            }
+        }
+
+        if let Some(max_length) = data_schema.max_length {
+            if code_points_u32.map_or(true, |code_points| code_points > max_length) {
+                return Err(CheckStringError::MaxLength {
+                    expected: max_length,
+                    actual: code_points,
+                });
+            }
+        }
+    }
+
+    if let Some(pattern) = &data_schema.pattern {
+        let is_valid_pattern = Regex::new(pattern).map_or(false, |regex| regex.is_match(value));
+        if is_valid_pattern.not() {
+            return Err(CheckStringError::Pattern {
+                pattern,
+                string: value,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Debug)]
+enum CheckStringError<'a> {
+    MinLength { expected: u32, actual: usize },
+    MaxLength { expected: u32, actual: usize },
+    Pattern { pattern: &'a str, string: &'a str },
 }
 
 mod sealed {
