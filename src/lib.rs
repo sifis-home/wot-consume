@@ -4,6 +4,7 @@
 
 mod data_schema_validator;
 
+use core::slice;
 use std::{
     array,
     convert::identity,
@@ -22,6 +23,7 @@ use bitflags::bitflags;
 use regex::Regex;
 use reqwest::Url;
 use sealed::HasHttpProtocolExtension;
+use serde::de::DeserializeOwned;
 use smallvec::{smallvec, SmallVec};
 use tracing::warn;
 use wot_td::{
@@ -647,7 +649,7 @@ pub struct PropertyReader<'a, T> {
     _marker: PhantomData<fn() -> T>,
 }
 
-impl<T> PropertyReader<'_, T> {
+impl<'a, T> PropertyReader<'a, T> {
     pub fn no_security(&mut self) -> &mut Self {
         self.filter_security_scheme(StatefulSecurityScheme::NoSecurity)
     }
@@ -737,13 +739,39 @@ impl<T> PropertyReader<'_, T> {
         self
     }
 
-    pub fn send(&self) -> Result<PropertyReaderSendFuture<T>, PropertyReaderSendError<'_>> {
-        let status = self
+    pub fn send(&'a self) -> Result<PropertyReaderSendFuture<T>, PropertyReaderSendError<'a>>
+    where
+        T: DeserializeOwned,
+    {
+        let PropertyReaderInner {
+            property,
+            base,
+            forms,
+            uri_variables,
+            security,
+        } = self
             .status
             .as_ref()
             .map_err(|err| PropertyReaderSendError::PropertyReader(err.clone()))?;
 
-        todo!()
+        let mut forms = forms
+            .iter()
+            .filter(|form| form.op.contains(&FormOperation::ReadProperty));
+        let form = forms.next().ok_or(PropertyReaderSendError::NoForms)?;
+        if forms.next().is_some() {
+            return Err(PropertyReaderSendError::MultipleChoices);
+        }
+        let security = security
+            .as_ref()
+            .unwrap_or(&StatefulSecurityScheme::NoSecurity);
+
+        Ok(PropertyReaderSendFuture::new(
+            form,
+            base,
+            uri_variables,
+            security,
+            &property.data_schema,
+        ))
     }
 
     fn filter_security_scheme(&mut self, security_scheme: StatefulSecurityScheme) -> &mut Self {
@@ -827,7 +855,7 @@ enum PartialVecRefs<'a, T> {
     Some(Vec<&'a T>),
 }
 
-impl<T> PartialVecRefs<'_, T> {
+impl<'a, T> PartialVecRefs<'a, T> {
     fn retain<F>(&mut self, mut f: F)
     where
         F: FnMut(&&T) -> bool,
@@ -847,17 +875,68 @@ impl<T> PartialVecRefs<'_, T> {
         }
     }
 
-    fn len(&self) -> usize {
-        match self {
-            Self::Whole(data) => data.len(),
-            Self::Some(data) => data.len(),
-        }
-    }
-
     fn is_empty(&self) -> bool {
         match self {
             Self::Whole(data) => data.is_empty(),
             Self::Some(data) => data.is_empty(),
+        }
+    }
+
+    fn iter(&'a self) -> <&'a Self as IntoIterator>::IntoIter {
+        IntoIterator::into_iter(self)
+    }
+}
+
+impl<'a, T> IntoIterator for &'a PartialVecRefs<'a, T> {
+    type Item = &'a T;
+    type IntoIter = PartialVecRefsIter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        match self {
+            PartialVecRefs::Whole(data) => PartialVecRefsIter::Whole(data.iter()),
+            PartialVecRefs::Some(data) => PartialVecRefsIter::Some(data.iter()),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum PartialVecRefsIter<'a, T> {
+    Whole(slice::Iter<'a, T>),
+    Some(slice::Iter<'a, &'a T>),
+}
+
+impl<'a, T> Iterator for PartialVecRefsIter<'a, T> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Whole(iter) => iter.next(),
+            Self::Some(iter) => iter.next().copied(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Whole(iter) => iter.size_hint(),
+            Self::Some(iter) => iter.size_hint(),
+        }
+    }
+}
+
+impl<T> DoubleEndedIterator for PartialVecRefsIter<'_, T> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Whole(iter) => iter.next_back(),
+            Self::Some(iter) => iter.next_back().copied(),
+        }
+    }
+}
+
+impl<T> ExactSizeIterator for PartialVecRefsIter<'_, T> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Whole(iter) => iter.len(),
+            Self::Some(iter) => iter.len(),
         }
     }
 }
@@ -952,12 +1031,15 @@ pub struct PropertyReaderSendFuture<'a, T>(
     Result<Pin<Box<PropertyReaderSendFutureInner<'a, T>>>, PropertyReaderSendFutureError>,
 );
 
-impl<'a, T: 'a> PropertyReaderSendFuture<'a, T> {
+impl<'a, T: 'a> PropertyReaderSendFuture<'a, T>
+where
+    T: DeserializeOwned,
+{
     fn new(
         form: &Form,
         base: &Option<String>,
         uri_variables: &[(String, UriVariableValue)],
-        security: &StatefulSecurityScheme,
+        security: &'a StatefulSecurityScheme,
         data_schema: &'a DataSchema<(), (), ()>,
     ) -> Self {
         // TODO: move instantiation of reqwest client upstream
@@ -1035,6 +1117,8 @@ impl<'a, T: 'a> PropertyReaderSendFuture<'a, T> {
             StatefulSecurityScheme::Bearer(token) => builder.bearer_auth(token),
         };
 
+        // FIXME: unify the two condition in order to store (at least try to) an impl Future
+        // instead of a pin-boxed dyn Future
         match &form.content_type {
             Some(content_type) if content_type.eq_ignore_ascii_case("application/json") => Self(
                 Ok(perform_request(builder, handle_json_response, data_schema)),
@@ -1078,6 +1162,7 @@ where
 pub enum PropertyReaderSendError<'a> {
     PropertyReader(PropertyReaderError<'a>),
     MultipleChoices,
+    NoForms,
 }
 
 #[derive(Debug)]
@@ -1112,7 +1197,10 @@ pub enum PropertyReaderSendFutureInvalidResponse {
 async fn handle_json_response<T>(
     response: reqwest::Response,
     data_schema: &DataSchema<(), (), ()>,
-) -> Result<T, PropertyReaderSendFutureInvalidResponse> {
+) -> Result<T, PropertyReaderSendFutureInvalidResponse>
+where
+    T: DeserializeOwned,
+{
     handle_json_response_inner(response, data_schema)
         .await
         .map_err(PropertyReaderSendFutureInvalidResponse::Json)
@@ -1121,7 +1209,10 @@ async fn handle_json_response<T>(
 async fn handle_json_response_inner<T>(
     response: reqwest::Response,
     data_schema: &DataSchema<(), (), ()>,
-) -> Result<T, HandleJsonResponseError> {
+) -> Result<T, HandleJsonResponseError>
+where
+    T: DeserializeOwned,
+{
     let data: serde_json::Value = response
         .json()
         .await
@@ -1129,7 +1220,7 @@ async fn handle_json_response_inner<T>(
 
     handle_json_response_validate(&data, data_schema)
         .map_err(HandleJsonResponseRefError::into_owned)?;
-    todo!()
+    serde_json::from_value(data).map_err(HandleJsonResponseError::Deserialization)
 }
 
 struct ResponseValidatorState<'a> {
@@ -1451,11 +1542,11 @@ pub enum HandleJsonResponseError {
     ObjectSubtype(ObjectSubtypeError),
     TooManyChildren,
     TooDeep,
+    Deserialization(serde_json::Error),
 }
 
 #[derive(Debug)]
 pub enum HandleJsonResponseRefError<'a> {
-    Json(reqwest::Error),
     WriteOnly,
     Constant {
         expected: &'a serde_json::Value,
@@ -1485,7 +1576,6 @@ pub enum HandleJsonResponseRefError<'a> {
 impl HandleJsonResponseRefError<'_> {
     pub fn into_owned(self) -> HandleJsonResponseError {
         match self {
-            Self::Json(err) => HandleJsonResponseError::Json(err),
             Self::WriteOnly => HandleJsonResponseError::WriteOnly,
             Self::Constant { expected, found } => HandleJsonResponseError::Constant {
                 expected: expected.clone(),
