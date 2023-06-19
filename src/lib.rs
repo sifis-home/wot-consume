@@ -3,6 +3,7 @@
 //! Provides all the building blocks to consume (use) [Web Of Things](https://www.w3.org/WoT/) Things.
 
 mod data_schema_validator;
+mod sealed;
 
 use core::slice;
 use std::{
@@ -11,10 +12,8 @@ use std::{
     fmt::{self, Display},
     future::Future,
     marker::PhantomData,
-    mem,
     num::NonZeroU64,
     ops::{BitOr, Not},
-    pin::Pin,
     rc::Rc,
     str::FromStr,
 };
@@ -38,7 +37,10 @@ use wot_td::{
 };
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-pub async fn consume<Other>(td: &Thing<Other>) -> Result<Consumer, ConsumeError>
+pub async fn consume<Other>(
+    td: &Thing<Other>,
+    client: reqwest::Client,
+) -> Result<Consumer, ConsumeError>
 where
     Other: HasHttpProtocolExtension + ExtendableThing,
 {
@@ -155,7 +157,11 @@ where
 
     properties.sort_unstable_by(|a, b| a.name.cmp(&b.name));
     let base = td.base.clone();
-    Ok(Consumer { base, properties })
+    Ok(Consumer {
+        base,
+        properties,
+        client,
+    })
 }
 
 #[derive(Debug)]
@@ -176,6 +182,7 @@ pub enum ConsumeError {
 pub struct Consumer {
     base: Option<String>,
     properties: Vec<Property>,
+    client: reqwest::Client,
     // TODO: other
 }
 
@@ -188,7 +195,13 @@ impl Consumer {
             .map(|index| {
                 let property = &self.properties[index];
                 let base = &self.base;
-                PropertyRef { property, base }
+                let client = &self.client;
+
+                PropertyRef {
+                    property,
+                    base,
+                    client,
+                }
             })
     }
 }
@@ -197,6 +210,7 @@ impl Consumer {
 pub struct PropertyRef<'a> {
     property: &'a Property,
     base: &'a Option<String>,
+    client: &'a reqwest::Client,
 }
 
 #[derive(Debug)]
@@ -216,6 +230,7 @@ impl<'a> PropertyRef<'a> {
             uri_variables: Vec::new(),
             security: None,
             base: self.base,
+            client: self.client,
         };
         PropertyReader {
             status: Ok(inner),
@@ -739,7 +754,12 @@ impl<'a, T> PropertyReader<'a, T> {
         self
     }
 
-    pub fn send(&'a self) -> Result<PropertyReaderSendFuture<T>, PropertyReaderSendError<'a>>
+    pub fn send(
+        &self,
+    ) -> Result<
+        impl Future<Output = Result<T, PropertyReaderSendFutureError>> + '_,
+        PropertyReaderSendError<'_>,
+    >
     where
         T: DeserializeOwned,
     {
@@ -749,6 +769,7 @@ impl<'a, T> PropertyReader<'a, T> {
             forms,
             uri_variables,
             security,
+            client,
         } = self
             .status
             .as_ref()
@@ -761,17 +782,16 @@ impl<'a, T> PropertyReader<'a, T> {
         if forms.next().is_some() {
             return Err(PropertyReaderSendError::MultipleChoices);
         }
-        let security = security
-            .as_ref()
-            .unwrap_or(&StatefulSecurityScheme::NoSecurity);
 
-        Ok(PropertyReaderSendFuture::new(
+        create_property_reader_send_future(
             form,
             base,
             uri_variables,
             security,
             &property.data_schema,
-        ))
+            client,
+        )
+        .map_err(PropertyReaderSendError::InitFuture)
     }
 
     fn filter_security_scheme(&mut self, security_scheme: StatefulSecurityScheme) -> &mut Self {
@@ -810,6 +830,7 @@ struct PropertyReaderInner<'a> {
     forms: PartialVecRefs<'a, Form>,
     uri_variables: Vec<(String, UriVariableValue)>,
     security: Option<StatefulSecurityScheme>,
+    client: &'a reqwest::Client,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1024,138 +1045,120 @@ impl FromStr for Protocol {
     }
 }
 
-type PropertyReaderSendFutureInner<'a, T> =
-    dyn Future<Output = Result<T, PropertyReaderSendFutureError>> + 'a;
-
-pub struct PropertyReaderSendFuture<'a, T>(
-    Result<Pin<Box<PropertyReaderSendFutureInner<'a, T>>>, PropertyReaderSendFutureError>,
-);
-
-impl<'a, T: 'a> PropertyReaderSendFuture<'a, T>
+fn create_property_reader_send_future<'a, T>(
+    form: &Form,
+    base: &Option<String>,
+    uri_variables: &[(String, UriVariableValue)],
+    security: &'a Option<StatefulSecurityScheme>,
+    data_schema: &'a DataSchema<(), (), ()>,
+    client: &reqwest::Client,
+) -> Result<
+    impl Future<Output = Result<T, PropertyReaderSendFutureError>> + 'a,
+    PropertyReaderSendFutureInitError,
+>
 where
-    T: DeserializeOwned,
+    T: DeserializeOwned + 'a,
 {
-    fn new(
-        form: &Form,
-        base: &Option<String>,
-        uri_variables: &[(String, UriVariableValue)],
-        security: &'a StatefulSecurityScheme,
-        data_schema: &'a DataSchema<(), (), ()>,
-    ) -> Self {
-        // TODO: move instantiation of reqwest client upstream
-        let client = reqwest::Client::new();
-
-        let url = form
-            .href
-            .parse::<Url>()
-            .or_else(|err| match err {
-                url::ParseError::RelativeUrlWithoutBase => base
-                    .as_ref()
-                    .ok_or_else(|| {
-                        PropertyReaderSendFutureError::RelativeUrlWithoutBase(form.href.clone())
+    let url = form
+        .href
+        .parse::<Url>()
+        .or_else(|err| match err {
+            url::ParseError::RelativeUrlWithoutBase => base
+                .as_ref()
+                .ok_or_else(|| {
+                    PropertyReaderSendFutureInitError::RelativeUrlWithoutBase(form.href.clone())
+                })
+                .and_then(|base| {
+                    base.parse::<Url>().map_err(|source| {
+                        PropertyReaderSendFutureInitError::InvalidBase {
+                            base: base.to_string(),
+                            href: form.href.clone(),
+                            source,
+                        }
                     })
-                    .and_then(|base| {
-                        base.parse::<Url>().map_err(|source| {
-                            PropertyReaderSendFutureError::InvalidBase {
-                                base: base.to_string(),
-                                href: form.href.clone(),
-                                source,
-                            }
-                        })
+                })
+                .and_then(|base| {
+                    base.join(&form.href).map_err(|source| {
+                        PropertyReaderSendFutureInitError::InvalidJoinedHref {
+                            base,
+                            href: form.href.clone(),
+                            source,
+                        }
                     })
-                    .and_then(|base| {
-                        base.join(&form.href).map_err(|source| {
-                            PropertyReaderSendFutureError::InvalidJoinedHref {
-                                base,
-                                href: form.href.clone(),
-                                source,
-                            }
-                        })
-                    }),
-                _ => Err(PropertyReaderSendFutureError::InvalidHref {
-                    href: form.href.clone(),
-                    source: err,
                 }),
-            })
-            .map(|mut url| {
-                use std::fmt::Write;
+            _ => Err(PropertyReaderSendFutureInitError::InvalidHref {
+                href: form.href.clone(),
+                source: err,
+            }),
+        })
+        .map(|mut url| {
+            use std::fmt::Write;
 
-                let mut query_pairs = url.query_pairs_mut();
-                let mut buffer = String::new();
+            let mut query_pairs = url.query_pairs_mut();
+            let mut buffer = String::new();
 
-                for (name, value) in uri_variables {
-                    buffer.clear();
-                    write!(buffer, "{}", value).unwrap();
-                    query_pairs.append_pair(name, &buffer);
-                }
-
-                drop(query_pairs);
-                url
-            });
-        let url = match url {
-            Ok(url) => url,
-            Err(err) => return Self(Err(err)),
-        };
-
-        let method = form.method_name.map_or(reqwest::Method::GET, |method| {
-            use http::Method;
-            match method {
-                Method::Get => reqwest::Method::GET,
-                Method::Put => reqwest::Method::PUT,
-                Method::Post => reqwest::Method::POST,
-                Method::Delete => reqwest::Method::DELETE,
-                Method::Patch => reqwest::Method::PATCH,
+            for (name, value) in uri_variables {
+                buffer.clear();
+                write!(buffer, "{}", value).unwrap();
+                query_pairs.append_pair(name, &buffer);
             }
-        });
 
-        let builder = client.request(method, url);
-        let builder = match security {
-            StatefulSecurityScheme::NoSecurity => builder,
-            StatefulSecurityScheme::Basic { username, password } => {
-                builder.basic_auth(username, Some(password))
-            }
-            StatefulSecurityScheme::Bearer(token) => builder.bearer_auth(token),
-        };
+            drop(query_pairs);
+            url
+        })?;
 
-        // FIXME: unify the two condition in order to store (at least try to) an impl Future
-        // instead of a pin-boxed dyn Future
-        match &form.content_type {
-            Some(content_type) if content_type.eq_ignore_ascii_case("application/json") => Self(
-                Ok(perform_request(builder, handle_json_response, data_schema)),
-            ),
-            None => Self(Ok(perform_request(
-                builder,
-                handle_json_response,
-                data_schema,
-            ))),
-            Some(content_type) => Self(Err(PropertyReaderSendFutureError::InvalidResponse(
-                PropertyReaderSendFutureInvalidResponse::UnsupportedFormat(content_type.clone()),
-            ))),
+    let method = form.method_name.map_or(reqwest::Method::GET, |method| {
+        use http::Method;
+        match method {
+            Method::Get => reqwest::Method::GET,
+            Method::Put => reqwest::Method::PUT,
+            Method::Post => reqwest::Method::POST,
+            Method::Delete => reqwest::Method::DELETE,
+            Method::Patch => reqwest::Method::PATCH,
         }
+    });
+
+    let builder = client.request(method, url);
+    let builder = match security {
+        None | Some(StatefulSecurityScheme::NoSecurity) => builder,
+        Some(StatefulSecurityScheme::Basic { username, password }) => {
+            builder.basic_auth(username, Some(password))
+        }
+        Some(StatefulSecurityScheme::Bearer(token)) => builder.bearer_auth(token),
+    };
+
+    // FIXME: unify the two condition in order to store (at least try to) an impl Future
+    // instead of a pin-boxed dyn Future
+    match &form.content_type {
+        Some(content_type) if content_type.eq_ignore_ascii_case("application/json") => {
+            Ok(perform_request(builder, handle_json_response, data_schema))
+        }
+        None => Ok(perform_request(builder, handle_json_response, data_schema)),
+        Some(content_type) => Err(PropertyReaderSendFutureInitError::InvalidResponse(
+            PropertyReaderSendFutureInvalidResponse::UnsupportedFormat(content_type.clone()),
+        )),
     }
 }
 
-fn perform_request<'a, T, F, Fut>(
+async fn perform_request<'a, T, F, Fut>(
     builder: reqwest::RequestBuilder,
     response_handler: F,
     data_schema: &'a DataSchema<(), (), ()>,
-) -> Pin<Box<dyn Future<Output = Result<T, PropertyReaderSendFutureError>> + 'a>>
+) -> Result<T, PropertyReaderSendFutureError>
 where
     F: 'a + FnOnce(reqwest::Response, &'a DataSchema<(), (), ()>) -> Fut,
     Fut: 'a + Future<Output = Result<T, PropertyReaderSendFutureInvalidResponse>>,
 {
-    Box::pin(async move {
-        let response = builder
-            .send()
-            .await
-            .map_err(PropertyReaderSendFutureError::RequestError)?
-            .error_for_status()
-            .map_err(PropertyReaderSendFutureError::ResponseError)?;
+    let response = builder
+        .send()
+        .await
+        .map_err(PropertyReaderSendFutureError::RequestError)?
+        .error_for_status()
+        .map_err(PropertyReaderSendFutureError::ResponseError)?;
 
-        response_handler(response, data_schema)
-            .await
-            .map_err(PropertyReaderSendFutureError::InvalidResponse)
-    })
+    response_handler(response, data_schema)
+        .await
+        .map_err(PropertyReaderSendFutureError::InvalidResponse)
 }
 
 #[derive(Debug)]
@@ -1163,10 +1166,11 @@ pub enum PropertyReaderSendError<'a> {
     PropertyReader(PropertyReaderError<'a>),
     MultipleChoices,
     NoForms,
+    InitFuture(PropertyReaderSendFutureInitError),
 }
 
 #[derive(Debug)]
-pub enum PropertyReaderSendFutureError {
+pub enum PropertyReaderSendFutureInitError {
     InvalidHref {
         href: String,
         source: url::ParseError,
@@ -1182,6 +1186,11 @@ pub enum PropertyReaderSendFutureError {
         href: String,
         source: url::ParseError,
     },
+    InvalidResponse(PropertyReaderSendFutureInvalidResponse),
+}
+
+#[derive(Debug)]
+pub enum PropertyReaderSendFutureError {
     InvalidResponse(PropertyReaderSendFutureInvalidResponse),
     RequestError(reqwest::Error),
     ResponseError(reqwest::Error),
@@ -2064,135 +2073,40 @@ enum CheckStringError<'a> {
     Pattern { pattern: &'a str, string: &'a str },
 }
 
-mod sealed {
+#[cfg(test)]
+mod tests {
+    use reqwest::Client;
     use wot_td::{
-        extend::ExtendableThing,
-        hlist::{self, HListRef, NonEmptyHList},
-        protocol::http::{self, HttpProtocol},
+        builder::{BuildableInteractionAffordance, SpecializableDataSchema},
+        Thing,
     };
 
-    pub trait HasHttpProtocolExtension: Sized + ExtendableThing {
-        fn http_protocol(&self) -> &HttpProtocol;
-        fn http_protocol_form(form: &Self::Form) -> &http::Form;
-    }
+    use super::*;
 
-    impl HasHttpProtocolExtension for HttpProtocol {
-        #[inline]
-        fn http_protocol(&self) -> &HttpProtocol {
-            self
-        }
+    #[tokio::test]
+    async fn get_simple_property() {
+        let client = Client::new();
+        let td = Thing::builder("test")
+            .finish_extend()
+            .property("prop1", |b| {
+                b.finish_extend_data_schema()
+                    .integer()
+                    .form(|b| b.href("/test"))
+            })
+            .build()
+            .unwrap();
 
-        #[inline]
-        fn http_protocol_form(form: &Self::Form) -> &http::Form {
-            form
-        }
-    }
+        let prop = consume(&td, client)
+            .await
+            .unwrap()
+            .property("test")
+            .unwrap()
+            .read()
+            .send()
+            .unwrap()
+            .await
+            .unwrap();
 
-    macro_rules! impl_hlist_with_http_protocol_in_head {
-        (
-            @make_hlist
-        ) => {
-            hlist::Cons<HttpProtocol>
-        };
-
-        (
-            @make_hlist
-            $generic:ident $(, $($rest:tt)*)?
-        ) => {
-           hlist::Cons<
-               $generic,
-               impl_hlist_with_http_protocol_in_head!(@make_hlist $($($rest)*)?),
-            >
-        };
-
-        (
-            @make_impl
-            $(
-                $($generic:ident),+
-            )?
-        ) => {
-            impl $(< $($generic),+ >)? HasHttpProtocolExtension for impl_hlist_with_http_protocol_in_head!(@make_hlist $($($generic),+)?)
-            $(
-                where
-                    $(
-                        $generic : wot_td::extend::ExtendableThing
-                    ),+
-            )?
-            {
-                #[inline]
-                fn http_protocol(&self) -> &HttpProtocol {
-                    self.to_ref().split_last().0
-                }
-
-                #[inline]
-                fn http_protocol_form(form: &Self::Form) -> &http::Form {
-                    form.to_ref().split_last().0
-                }
-            }
-        };
-
-        (
-            $(
-                $($generic:ident),* $(,)?
-            );+
-        ) => {
-            $(
-                impl_hlist_with_http_protocol_in_head!(@make_impl $($generic),*);
-            )*
-        };
-    }
-
-    impl_hlist_with_http_protocol_in_head!(
-        A;
-        A, B;
-        A, B, C;
-        A, B, C, D;
-        A, B, C, D, E;
-        A, B, C, D, E, F;
-        A, B, C, D, E, F, G;
-        A, B, C, D, E, F, G, H;
-        A, B, C, D, E, F, G, H, I;
-        A, B, C, D, E, F, G, H, I, J;
-        A, B, C, D, E, F, G, H, I, J, K;
-        A, B, C, D, E, F, G, H, I, J, K, L;
-        A, B, C, D, E, F, G, H, I, J, K, L, M;
-        A, B, C, D, E, F, G, H, I, J, K, L, M, N;
-        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O;
-        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P;
-        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q;
-        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R;
-        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S;
-        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T;
-        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U;
-        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V;
-        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W;
-        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X;
-        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y;
-        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z;
-        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z, AA;
-        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z, AA, AB;
-        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z, AA, AB, AC;
-        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z, AA, AB, AC, AD;
-        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z, AA, AB, AC, AD, AE;
-        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z, AA, AB, AC, AD, AE, AF;
-    );
-
-    #[cfg(test)]
-    mod tests {
-        use wot_td::protocol::coap::CoapProtocol;
-
-        use super::*;
-
-        #[test]
-        fn http_protocol() {
-            let proto = HttpProtocol {};
-            assert!(std::ptr::eq(proto.http_protocol(), &proto));
-
-            let list = hlist::Nil::cons(HttpProtocol {})
-                .cons(CoapProtocol {})
-                .cons(CoapProtocol {})
-                .cons(CoapProtocol {});
-            let _http: &HttpProtocol = list.http_protocol();
-        }
+        todo!()
     }
 }
