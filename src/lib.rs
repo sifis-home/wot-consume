@@ -1094,16 +1094,16 @@ where
         .map(|mut url| {
             use std::fmt::Write;
 
-            let mut query_pairs = url.query_pairs_mut();
-            let mut buffer = String::new();
+            if uri_variables.is_empty().not() {
+                let mut query_pairs = url.query_pairs_mut();
+                let mut buffer = String::new();
 
-            for (name, value) in uri_variables {
-                buffer.clear();
-                write!(buffer, "{}", value).unwrap();
-                query_pairs.append_pair(name, &buffer);
+                for (name, value) in uri_variables {
+                    buffer.clear();
+                    write!(buffer, "{}", value).unwrap();
+                    query_pairs.append_pair(name, &buffer);
+                }
             }
-
-            drop(query_pairs);
             url
         })?;
 
@@ -2075,28 +2075,74 @@ enum CheckStringError<'a> {
 
 #[cfg(test)]
 mod tests {
-    use reqwest::Client;
+    use std::{sync::OnceLock, time::Duration};
+
+    use reqwest::{Client, StatusCode};
+    use serde::Serialize;
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, ResponseTemplate, Times,
+    };
     use wot_td::{
-        builder::{BuildableInteractionAffordance, SpecializableDataSchema},
+        builder::{
+            BuildableInteractionAffordance, IntegerDataSchemaBuilderLike, SpecializableDataSchema,
+        },
+        protocol::http,
         Thing,
     };
 
     use super::*;
 
+    fn client() -> Client {
+        static CLIENT: OnceLock<Client> = OnceLock::new();
+
+        CLIENT
+            .get_or_init(|| {
+                Client::builder()
+                    .timeout(Duration::from_secs(1))
+                    .connect_timeout(Duration::from_secs(1))
+                    .build()
+                    .unwrap()
+            })
+            .clone()
+    }
+
+    async fn check_no_uri_variables_used(endpoints: &[&str], mock_server: &MockServer) {
+        mock_server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| endpoints.contains(&request.url.path()))
+            .for_each(|request| assert!(request.url.query().is_none()));
+    }
+
     #[tokio::test]
     async fn get_simple_property() {
-        let client = Client::new();
+        let mock_server = MockServer::start().await;
         let td = Thing::builder("test")
+            .ext(http::HttpProtocol {})
             .finish_extend()
-            .property("prop1", |b| {
-                b.finish_extend_data_schema()
+            .base(mock_server.uri())
+            .property("test", |b| {
+                b.ext(())
+                    .ext_interaction(())
+                    .ext_data_schema(())
+                    .finish_extend_data_schema()
                     .integer()
-                    .form(|b| b.href("/test"))
+                    .form(|b| b.ext(http::Form::default()).href("/testing-url"))
             })
             .build()
             .unwrap();
 
-        let prop = consume(&td, client)
+        Mock::given(method("GET"))
+            .and(path("/testing-url"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(42))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let prop: i16 = consume(&td, client())
             .await
             .unwrap()
             .property("test")
@@ -2107,6 +2153,125 @@ mod tests {
             .await
             .unwrap();
 
-        todo!()
+        assert_eq!(prop, 42);
+        mock_server.verify().await;
+        check_no_uri_variables_used(&["/testing-url"], &mock_server).await;
+    }
+
+    #[tokio::test]
+    async fn missing_property_in_td() {
+        let mock_server = MockServer::start().await;
+        let td = Thing::builder("test")
+            .ext(http::HttpProtocol {})
+            .finish_extend()
+            .base(mock_server.uri())
+            .property("test", |b| {
+                b.ext(())
+                    .ext_interaction(())
+                    .ext_data_schema(())
+                    .finish_extend_data_schema()
+                    .integer()
+                    .form(|b| b.ext(http::Form::default()).href("/testing-url"))
+            })
+            .build()
+            .unwrap();
+
+        assert!(consume(&td, client())
+            .await
+            .unwrap()
+            .property("missing-test")
+            .is_none());
+
+        mock_server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn missing_property_from_server() {
+        let mock_server = MockServer::start().await;
+        let td = Thing::builder("test")
+            .ext(http::HttpProtocol {})
+            .finish_extend()
+            .base(mock_server.uri())
+            .property("test", |b| {
+                b.ext(())
+                    .ext_interaction(())
+                    .ext_data_schema(())
+                    .finish_extend_data_schema()
+                    .integer()
+                    .form(|b| b.ext(http::Form::default()).href("/testing-url"))
+            })
+            .build()
+            .unwrap();
+
+        let err = consume(&td, client())
+            .await
+            .unwrap()
+            .property("test")
+            .unwrap()
+            .read::<i16>()
+            .send()
+            .unwrap()
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            PropertyReaderSendFutureError::ResponseError(reqwest_error)
+            if reqwest_error.is_status() &&
+            reqwest_error.status() == Some(StatusCode::NOT_FOUND)
+        ));
+        mock_server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn failing_minimum_integer() {
+        let mock_server = MockServer::start().await;
+        let td = Thing::builder("test")
+            .ext(http::HttpProtocol {})
+            .finish_extend()
+            .base(mock_server.uri())
+            .property("test", |b| {
+                b.ext(())
+                    .ext_interaction(())
+                    .ext_data_schema(())
+                    .finish_extend_data_schema()
+                    .integer()
+                    .minimum(43)
+                    .form(|b| b.ext(http::Form::default()).href("/testing-url"))
+            })
+            .build()
+            .unwrap();
+
+        Mock::given(method("GET"))
+            .and(path("/testing-url"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(42))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let err = consume(&td, client())
+            .await
+            .unwrap()
+            .property("test")
+            .unwrap()
+            .read::<i16>()
+            .send()
+            .unwrap()
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            PropertyReaderSendFutureError::InvalidResponse(
+                PropertyReaderSendFutureInvalidResponse::Json(
+                    HandleJsonResponseError::IntegerSubtype(NumericSubtypeError::Minimum {
+                        expected: Minimum::Inclusive(43),
+                        found: 42,
+                    }),
+                ),
+            ),
+        ));
+        mock_server.verify().await;
+        check_no_uri_variables_used(&["/testing-url"], &mock_server).await;
     }
 }
