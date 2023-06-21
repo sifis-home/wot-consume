@@ -1454,21 +1454,30 @@ fn handle_json_response_validate_impl<'a, const N: usize>(
             }
 
             (DataSchemaSubtype::Number(data_schema), Value::Number(response)) => {
-                let Some(value) = response.as_f64() else {
-                    return Err(HandleJsonResponseRefError::NumberSubtype(
-                        NumericSubtypeError::InvalidType(response.clone()),
-                    ));
+                let value = if let Some(value) = response.as_i64() {
+                    if value > 0 {
+                        u32::try_from(value).ok().map(f64::from)
+                    } else {
+                        i32::try_from(value).ok().map(f64::from)
+                    }
+                } else {
+                    response.as_f64()
                 };
+                let value = value.ok_or_else(|| {
+                    HandleJsonResponseRefError::NumberSubtype(NumericSubtypeError::InvalidType(
+                        response.clone(),
+                    ))
+                })?;
 
                 check_number(data_schema, value)
                     .map_err(|err| HandleJsonResponseRefError::NumberSubtype(err.into()))?;
             }
             (DataSchemaSubtype::Integer(data_schema), Value::Number(response)) => {
-                let Some(value) = response.as_i64() else {
-                    return Err(HandleJsonResponseRefError::IntegerSubtype(
-                        NumericSubtypeError::InvalidType(response.clone()),
-                    ));
-                };
+                let value = get_integral_from_number(response).ok_or_else(|| {
+                    HandleJsonResponseRefError::IntegerSubtype(NumericSubtypeError::InvalidType(
+                        response.clone(),
+                    ))
+                })?;
 
                 check_integer(data_schema, value)
                     .map_err(|err| HandleJsonResponseRefError::IntegerSubtype(err.into()))?;
@@ -1757,12 +1766,18 @@ fn validate_uri_variable_value(
                 })?;
             }
             ScalarDataSchemaSubtype::Integer(schema) => {
-                let &UriVariableValue::Integer(value) = value else {
-                    return Err(InvalidUriVariableKind::Subtype(
-                        InvalidUriVariableKindSubtype::Integer(
-                            InvalidUriVariableKindSubtypeNumeric::Type
-                        )
-                    ));
+                let value = match *value {
+                    UriVariableValue::Integer(value) => value,
+                    UriVariableValue::Number(value) if value.fract().abs() < f64::EPSILON => {
+                        value as i64
+                    }
+                    _ => {
+                        return Err(InvalidUriVariableKind::Subtype(
+                            InvalidUriVariableKindSubtype::Integer(
+                                InvalidUriVariableKindSubtypeNumeric::Type,
+                            ),
+                        ))
+                    }
                 };
 
                 check_integer(schema, value).map_err(|err| {
@@ -2073,19 +2088,33 @@ enum CheckStringError<'a> {
     Pattern { pattern: &'a str, string: &'a str },
 }
 
+fn get_integral_from_number(number: &serde_json::Number) -> Option<i64> {
+    if let Some(value) = number.as_u64() {
+        value.try_into().ok()
+    } else if let Some(value) = number.as_i64() {
+        Some(value)
+    } else if let Some(value) = number.as_f64() {
+        (value.fract().abs() < f64::EPSILON).then_some(value as i64)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{sync::OnceLock, time::Duration};
 
     use reqwest::{Client, StatusCode};
     use serde::Serialize;
+    use serde_json::json;
     use wiremock::{
         matchers::{method, path},
         Mock, MockServer, ResponseTemplate, Times,
     };
     use wot_td::{
         builder::{
-            BuildableInteractionAffordance, IntegerDataSchemaBuilderLike, SpecializableDataSchema,
+            BuildableInteractionAffordance, DataSchemaBuilder, IntegerDataSchemaBuilderLike,
+            SpecializableDataSchema,
         },
         protocol::http,
         Thing,
@@ -2273,5 +2302,343 @@ mod tests {
         ));
         mock_server.verify().await;
         check_no_uri_variables_used(&["/testing-url"], &mock_server).await;
+    }
+
+    #[test]
+    fn validate_integer() {
+        handle_json_response_validate(
+            &json!(42),
+            &DataSchema {
+                subtype: Some(DataSchemaSubtype::Integer(IntegerSchema::default())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        handle_json_response_validate(
+            &json!(42),
+            &DataSchema {
+                subtype: Some(DataSchemaSubtype::Integer(IntegerSchema {
+                    maximum: Some(Maximum::Inclusive(42)),
+                    minimum: Some(Minimum::Inclusive(42)),
+                    multiple_of: Some(7.try_into().unwrap()),
+                })),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        handle_json_response_validate(
+            &json!(42),
+            &DataSchema {
+                subtype: Some(DataSchemaSubtype::Integer(IntegerSchema {
+                    maximum: Some(Maximum::Exclusive(43)),
+                    minimum: Some(Minimum::Exclusive(41)),
+                    multiple_of: None,
+                })),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            handle_json_response_validate(
+                &json!(42),
+                &DataSchema {
+                    subtype: Some(DataSchemaSubtype::Integer(IntegerSchema {
+                        minimum: Some(Minimum::Inclusive(43)),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err(),
+            HandleJsonResponseRefError::IntegerSubtype(NumericSubtypeError::Minimum {
+                expected: Minimum::Inclusive(43),
+                found: 42
+            })
+        ));
+
+        assert!(matches!(
+            handle_json_response_validate(
+                &json!(42),
+                &DataSchema {
+                    subtype: Some(DataSchemaSubtype::Integer(IntegerSchema {
+                        minimum: Some(Minimum::Exclusive(42)),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err(),
+            HandleJsonResponseRefError::IntegerSubtype(NumericSubtypeError::Minimum {
+                expected: Minimum::Exclusive(42),
+                found: 42
+            })
+        ));
+
+        assert!(matches!(
+            handle_json_response_validate(
+                &json!(42),
+                &DataSchema {
+                    subtype: Some(DataSchemaSubtype::Integer(IntegerSchema {
+                        maximum: Some(Maximum::Inclusive(41)),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err(),
+            HandleJsonResponseRefError::IntegerSubtype(NumericSubtypeError::Maximum {
+                expected: Maximum::Inclusive(41),
+                found: 42
+            })
+        ));
+
+        assert!(matches!(
+            handle_json_response_validate(
+                &json!(42),
+                &DataSchema {
+                    subtype: Some(DataSchemaSubtype::Integer(IntegerSchema {
+                        maximum: Some(Maximum::Exclusive(42)),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err(),
+            HandleJsonResponseRefError::IntegerSubtype(NumericSubtypeError::Maximum {
+                expected: Maximum::Exclusive(42),
+                found: 42
+            })
+        ));
+
+        assert!(matches!(
+            handle_json_response_validate(
+                &json!(42),
+                &DataSchema {
+                    subtype: Some(DataSchemaSubtype::Integer(IntegerSchema {
+                        multiple_of: Some(5.try_into().unwrap()),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err(),
+            HandleJsonResponseRefError::IntegerSubtype(NumericSubtypeError::MultipleOf {
+                expected,
+                found: 42
+            })
+            if expected.get() == 5
+        ));
+
+        assert!(matches!(
+            handle_json_response_validate(
+                &json!("hello"),
+                &DataSchema {
+                    subtype: Some(DataSchemaSubtype::Integer(IntegerSchema::default())),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err(),
+            HandleJsonResponseRefError::Subtype {
+                expected: DataSchemaStatelessSubtype::Integer,
+                found: serde_json::Value::String(found)
+            }
+            if found == "hello"
+        ));
+
+        handle_json_response_validate(
+            &json!(42.),
+            &DataSchema {
+                subtype: Some(DataSchemaSubtype::Integer(IntegerSchema::default())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            handle_json_response_validate(
+                &json!(42.5),
+                &DataSchema {
+                    subtype: Some(DataSchemaSubtype::Integer(IntegerSchema::default())),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err(),
+            HandleJsonResponseRefError::IntegerSubtype(NumericSubtypeError::InvalidType(invalid))
+            if invalid == serde_json::Number::from_f64(42.5).unwrap()
+        ));
+    }
+
+    #[test]
+    fn validate_number() {
+        handle_json_response_validate(
+            &json!(42.5),
+            &DataSchema {
+                subtype: Some(DataSchemaSubtype::Number(NumberSchema::default())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        handle_json_response_validate(
+            &json!(42.5),
+            &DataSchema {
+                subtype: Some(DataSchemaSubtype::Number(NumberSchema {
+                    maximum: Some(Maximum::Inclusive(42.5)),
+                    minimum: Some(Minimum::Inclusive(42.5)),
+                    multiple_of: Some(0.5),
+                })),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        handle_json_response_validate(
+            &json!(42.5),
+            &DataSchema {
+                subtype: Some(DataSchemaSubtype::Number(NumberSchema {
+                    maximum: Some(Maximum::Exclusive(42.6)),
+                    minimum: Some(Minimum::Exclusive(42.4)),
+                    multiple_of: None,
+                })),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            handle_json_response_validate(
+                &json!(42.5),
+                &DataSchema {
+                    subtype: Some(DataSchemaSubtype::Number(NumberSchema {
+                        minimum: Some(Minimum::Inclusive(42.6)),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err(),
+            HandleJsonResponseRefError::NumberSubtype(NumericSubtypeError::Minimum {
+                expected: Minimum::Inclusive(expected),
+                found,
+            })
+            if expected == 42.6 && found == 42.5
+        ));
+
+        assert!(matches!(
+            handle_json_response_validate(
+                &json!(42.5),
+                &DataSchema {
+                    subtype: Some(DataSchemaSubtype::Number(NumberSchema {
+                        minimum: Some(Minimum::Exclusive(42.5)),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err(),
+            HandleJsonResponseRefError::NumberSubtype(NumericSubtypeError::Minimum {
+                expected: Minimum::Exclusive(expected),
+                found,
+            })
+            if expected == 42.5 && found == 42.5
+        ));
+
+        assert!(matches!(
+            handle_json_response_validate(
+                &json!(42.5),
+                &DataSchema {
+                    subtype: Some(DataSchemaSubtype::Number(NumberSchema {
+                        maximum: Some(Maximum::Inclusive(42.4)),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err(),
+            HandleJsonResponseRefError::NumberSubtype(NumericSubtypeError::Maximum {
+                expected: Maximum::Inclusive(expected),
+                found,
+            })
+            if expected == 42.4 && found == 42.5
+        ));
+
+        assert!(matches!(
+            handle_json_response_validate(
+                &json!(42.5),
+                &DataSchema {
+                    subtype: Some(DataSchemaSubtype::Number(NumberSchema {
+                        maximum: Some(Maximum::Exclusive(42.5)),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err(),
+            HandleJsonResponseRefError::NumberSubtype(NumericSubtypeError::Maximum {
+                expected: Maximum::Exclusive(expected),
+                found,
+            })
+            if expected == 42.5 && found == 42.5
+        ));
+
+        assert!(matches!(
+            handle_json_response_validate(
+                &json!(42.5),
+                &DataSchema {
+                    subtype: Some(DataSchemaSubtype::Number(NumberSchema {
+                        multiple_of: Some(0.7),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err(),
+            HandleJsonResponseRefError::NumberSubtype(NumericSubtypeError::MultipleOf {
+                expected,
+                found,
+            })
+            if (expected - 0.7).abs() < f64::EPSILON && found == 42.5
+        ));
+
+        assert!(matches!(
+            handle_json_response_validate(
+                &json!("hello"),
+                &DataSchema {
+                    subtype: Some(DataSchemaSubtype::Number(NumberSchema::default())),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err(),
+            HandleJsonResponseRefError::Subtype {
+                expected: DataSchemaStatelessSubtype::Number,
+                found: serde_json::Value::String(found)
+            }
+            if found == "hello"
+        ));
+
+        handle_json_response_validate(
+            &json!(42),
+            &DataSchema {
+                subtype: Some(DataSchemaSubtype::Number(NumberSchema::default())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            handle_json_response_validate(
+                &json!(i64::MAX),
+                &DataSchema {
+                    subtype: Some(DataSchemaSubtype::Number(NumberSchema::default())),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err(),
+            HandleJsonResponseRefError::NumberSubtype(NumericSubtypeError::InvalidType(invalid))
+            if invalid == serde_json::Number::from(i64::MAX)
+        ));
     }
 }
