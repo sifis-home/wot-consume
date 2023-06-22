@@ -1454,20 +1454,24 @@ fn handle_json_response_validate_impl<'a, const N: usize>(
             }
 
             (DataSchemaSubtype::Number(data_schema), Value::Number(response)) => {
-                let value = if let Some(value) = response.as_i64() {
-                    if value > 0 {
-                        u32::try_from(value).ok().map(f64::from)
-                    } else {
-                        i32::try_from(value).ok().map(f64::from)
-                    }
-                } else {
-                    response.as_f64()
-                };
-                let value = value.ok_or_else(|| {
-                    HandleJsonResponseRefError::NumberSubtype(NumericSubtypeError::InvalidType(
-                        response.clone(),
-                    ))
-                })?;
+                #[inline]
+                fn convert<T>(x: impl TryInto<T>) -> Option<f64>
+                where
+                    f64: From<T>,
+                {
+                    x.try_into().ok().map(f64::from)
+                }
+
+                let value = response
+                    .as_u64()
+                    .map(convert::<u32>)
+                    .or_else(|| response.as_i64().map(convert::<i32>))
+                    .unwrap_or_else(|| response.as_f64())
+                    .ok_or_else(|| {
+                        HandleJsonResponseRefError::NumberSubtype(NumericSubtypeError::InvalidType(
+                            response.clone(),
+                        ))
+                    })?;
 
                 check_number(data_schema, value)
                     .map_err(|err| HandleJsonResponseRefError::NumberSubtype(err.into()))?;
@@ -2628,6 +2632,24 @@ mod tests {
         )
         .unwrap();
 
+        handle_json_response_validate(
+            &serde_json::Value::Number(serde_json::Number::from(42i64)),
+            &DataSchema {
+                subtype: Some(DataSchemaSubtype::Number(NumberSchema::default())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        handle_json_response_validate(
+            &json!(-42),
+            &DataSchema {
+                subtype: Some(DataSchemaSubtype::Number(NumberSchema::default())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
         assert!(matches!(
             handle_json_response_validate(
                 &json!(i64::MAX),
@@ -2640,5 +2662,431 @@ mod tests {
             HandleJsonResponseRefError::NumberSubtype(NumericSubtypeError::InvalidType(invalid))
             if invalid == serde_json::Number::from(i64::MAX)
         ));
+
+        assert!(matches!(
+            handle_json_response_validate(
+                &json!(u64::MAX),
+                &DataSchema {
+                    subtype: Some(DataSchemaSubtype::Number(NumberSchema::default())),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err(),
+            HandleJsonResponseRefError::NumberSubtype(NumericSubtypeError::InvalidType(invalid))
+            if invalid == serde_json::Number::from(u64::MAX)
+        ));
+    }
+
+    #[test]
+    fn validate_string() {
+        handle_json_response_validate(
+            &json!("hello 👋🏼"),
+            &DataSchema {
+                subtype: Some(DataSchemaSubtype::String(StringSchema::default())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        handle_json_response_validate(
+            &json!("hello 👋🏼"),
+            &DataSchema {
+                subtype: Some(DataSchemaSubtype::String(StringSchema {
+                    min_length: Some(8),
+                    max_length: Some(8),
+                    pattern: Some(r#"^[Hh]el{1,2}o(?: 👋[🏻🏼🏽🏾🏿]?)?( world)?!?"#.to_string()),
+                    content_encoding: Some("blorgz".to_string()),
+                    content_media_type: Some("plain/text".to_string()),
+                })),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            handle_json_response_validate(
+                &json!("hello 👋🏼"),
+                &DataSchema {
+                    subtype: Some(DataSchemaSubtype::String(StringSchema {
+                        min_length: Some(9),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err(),
+            HandleJsonResponseRefError::StringSubtype(StringSubtypeRefError::MinLength {
+                expected: 9,
+                actual: 8,
+            })
+        ));
+
+        assert!(matches!(
+            handle_json_response_validate(
+                &json!("hello 👋🏼"),
+                &DataSchema {
+                    subtype: Some(DataSchemaSubtype::String(StringSchema {
+                        max_length: Some(7),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err(),
+            HandleJsonResponseRefError::StringSubtype(StringSubtypeRefError::MaxLength {
+                expected: 7,
+                actual: 8,
+            })
+        ));
+
+        assert!(matches!(
+            handle_json_response_validate(
+                &json!("hello 👋🏼"),
+                &DataSchema {
+                    subtype: Some(DataSchemaSubtype::String(StringSchema {
+                        pattern: Some(r#"^hello( world)?$"#.to_string()),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err(),
+            HandleJsonResponseRefError::StringSubtype(StringSubtypeRefError::Pattern {
+                pattern: r#"^hello( world)?$"#,
+                string: "hello 👋🏼",
+            })
+        ));
+    }
+
+    #[test]
+    fn validate_null() {
+        handle_json_response_validate(
+            &json!(null),
+            &DataSchema {
+                subtype: Some(DataSchemaSubtype::Null),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            handle_json_response_validate(
+                &json!(3),
+                &DataSchema {
+                    subtype: Some(DataSchemaSubtype::Null),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err(),
+            HandleJsonResponseRefError::Subtype {
+                expected: DataSchemaStatelessSubtype::Null,
+                found: serde_json::Value::Number(found),
+            }
+            if found.as_u64() == Some(3)
+        ))
+    }
+
+    #[test]
+    fn validate_boolean() {
+        handle_json_response_validate(
+            &json!(true),
+            &DataSchema {
+                subtype: Some(DataSchemaSubtype::Boolean),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        handle_json_response_validate(
+            &json!(false),
+            &DataSchema {
+                subtype: Some(DataSchemaSubtype::Boolean),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            handle_json_response_validate(
+                &json!(3),
+                &DataSchema {
+                    subtype: Some(DataSchemaSubtype::Boolean),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err(),
+            HandleJsonResponseRefError::Subtype {
+                expected: DataSchemaStatelessSubtype::Boolean,
+                found: serde_json::Value::Number(found),
+            }
+            if found.as_u64() == Some(3)
+        ))
+    }
+
+    #[test]
+    fn validate_array() {
+        handle_json_response_validate(
+            &json!([1, "two", 3., null, true, ["nes", "ted"], {"hello": 1, "world": true}]),
+            &DataSchema {
+                subtype: Some(DataSchemaSubtype::Array(ArraySchema::default())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        handle_json_response_validate(
+            &json!([1, "two", 3., null, true, ["nes", "ted"], {"hello": 1, "world": true}]),
+            &DataSchema {
+                subtype: Some(DataSchemaSubtype::Array(ArraySchema {
+                    items: Some(BoxedElemOrVec::Vec(vec![
+                        DataSchema {
+                            subtype: Some(DataSchemaSubtype::Integer(IntegerSchema::default())),
+                            ..Default::default()
+                        },
+                        DataSchema {
+                            subtype: Some(DataSchemaSubtype::String(StringSchema::default())),
+                            ..Default::default()
+                        },
+                        DataSchema {
+                            subtype: Some(DataSchemaSubtype::Number(NumberSchema::default())),
+                            ..Default::default()
+                        },
+                        DataSchema {
+                            subtype: Some(DataSchemaSubtype::Null),
+                            ..Default::default()
+                        },
+                        DataSchema {
+                            subtype: Some(DataSchemaSubtype::Boolean),
+                            ..Default::default()
+                        },
+                        DataSchema {
+                            subtype: Some(DataSchemaSubtype::Array(ArraySchema::default())),
+                            ..Default::default()
+                        },
+                        DataSchema {
+                            subtype: Some(DataSchemaSubtype::Object(ObjectSchema::default())),
+                            ..Default::default()
+                        },
+                    ])),
+                    min_items: Some(7),
+                    max_items: Some(7),
+                    other: (),
+                })),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        handle_json_response_validate(
+            &json!([1, 2, 3, 4, 5, 6, 7]),
+            &DataSchema {
+                subtype: Some(DataSchemaSubtype::Array(ArraySchema {
+                    items: Some(BoxedElemOrVec::Elem(Box::new(DataSchema {
+                        subtype: Some(DataSchemaSubtype::Integer(IntegerSchema::default())),
+                        ..Default::default()
+                    }))),
+                    min_items: Some(7),
+                    max_items: Some(7),
+                    other: (),
+                })),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        handle_json_response_validate(
+            &json!([1, "two", 3., null, true, ["nes", "ted"], {"hello": 1, "world": true}]),
+            &DataSchema {
+                subtype: Some(DataSchemaSubtype::Array(ArraySchema {
+                    items: Some(BoxedElemOrVec::Vec(vec![DataSchema {
+                        subtype: Some(DataSchemaSubtype::Integer(IntegerSchema::default())),
+                        ..Default::default()
+                    }])),
+                    min_items: Some(7),
+                    max_items: Some(7),
+                    other: (),
+                })),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            handle_json_response_validate(
+                &json!([1, "two", null, true, ["nes", "ted"], {"hello": 1, "world": true}]),
+                &DataSchema {
+                    subtype: Some(DataSchemaSubtype::Array(ArraySchema {
+                        items: Some(BoxedElemOrVec::Vec(vec![
+                            DataSchema {
+                                subtype: Some(DataSchemaSubtype::Integer(IntegerSchema::default())),
+                                ..Default::default()
+                            },
+                            DataSchema {
+                                subtype: Some(DataSchemaSubtype::String(StringSchema::default())),
+                                ..Default::default()
+                            },
+                            DataSchema {
+                                subtype: Some(DataSchemaSubtype::Number(NumberSchema::default())),
+                                ..Default::default()
+                            },
+                        ])),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err(),
+            HandleJsonResponseRefError::Subtype {
+                expected: DataSchemaStatelessSubtype::Number,
+                found: &serde_json::Value::Null,
+            }
+        ));
+
+        assert!(matches!(
+            handle_json_response_validate(
+                &json!([1, 2, 3., 3.5, 4., 5]),
+                &DataSchema {
+                    subtype: Some(DataSchemaSubtype::Array(ArraySchema {
+                        items: Some(BoxedElemOrVec::Elem(Box::new(DataSchema {
+                            subtype: Some(DataSchemaSubtype::Integer(IntegerSchema::default())),
+                            ..Default::default()
+                        }))),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err(),
+            HandleJsonResponseRefError::IntegerSubtype(NumericSubtypeError::InvalidType(found))
+            if found.as_f64() == Some(3.5)
+        ));
+
+        assert!(matches!(
+            handle_json_response_validate(
+                &json!([1, "two", 3., null, true, ["nes", "ted"], {"hello": 1, "world": true}]),
+                &DataSchema {
+                    subtype: Some(DataSchemaSubtype::Array(ArraySchema {
+                        min_items: Some(8),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err(),
+            HandleJsonResponseRefError::ArraySubtype(ArraySubtypeError::MinItems {
+                expected: 8,
+                found: 7,
+            })
+        ));
+
+        assert!(matches!(
+            handle_json_response_validate(
+                &json!([1, "two", 3., null, true, ["nes", "ted"], {"hello": 1, "world": true}]),
+                &DataSchema {
+                    subtype: Some(DataSchemaSubtype::Array(ArraySchema {
+                        max_items: Some(6),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err(),
+            HandleJsonResponseRefError::ArraySubtype(ArraySubtypeError::MaxItems {
+                expected: 6,
+                found: 7,
+            })
+        ));
+    }
+
+    #[test]
+    fn validate_object() {
+        handle_json_response_validate(
+            &json!({
+                "hello": null,
+                "world": 3.5,
+                "this": "is",
+                "fine": true,
+                "house": ["on", {
+                    "fire": 234,
+                    "water": 1,
+                }],
+            }),
+            &DataSchema {
+                subtype: Some(DataSchemaSubtype::Object(ObjectSchema::default())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        handle_json_response_validate(
+            &json!({
+                "hello": null,
+                "world": 3.5,
+                "this": "is",
+                "fine": true,
+                "house": ["on", {
+                    "fire": 234,
+                    "water": 1,
+                }],
+            }),
+            &DataSchema {
+                subtype: Some(DataSchemaSubtype::Object(ObjectSchema {
+                    properties: Some(
+                        [
+                            (
+                                "hello".to_string(),
+                                DataSchema {
+                                    subtype: Some(DataSchemaSubtype::Null),
+                                    ..Default::default()
+                                },
+                            ),
+                            (
+                                "world".to_string(),
+                                DataSchema {
+                                    subtype: Some(DataSchemaSubtype::Number(
+                                        NumberSchema::default(),
+                                    )),
+                                    ..Default::default()
+                                },
+                            ),
+                            (
+                                "this".to_string(),
+                                DataSchema {
+                                    constant: Some(json!("is")),
+                                    ..Default::default()
+                                },
+                            ),
+                            (
+                                "fine".to_string(),
+                                DataSchema {
+                                    subtype: Some(DataSchemaSubtype::Boolean),
+                                    ..Default::default()
+                                },
+                            ),
+                            (
+                                "house".to_string(),
+                                DataSchema {
+                                    subtype: Some(DataSchemaSubtype::Array(ArraySchema::default())),
+                                    ..Default::default()
+                                },
+                            ),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    ),
+                    required: Some(vec![
+                        "hello".to_string(),
+                        "world".to_string(),
+                        "this".to_string(),
+                        "fine".to_string(),
+                    ]),
+                    other: (),
+                })),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        todo!()
     }
 }
