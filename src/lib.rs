@@ -7,7 +7,6 @@ mod json;
 mod sealed;
 
 use std::{
-    array,
     convert::identity,
     fmt::{self, Display},
     future::Future,
@@ -1233,6 +1232,7 @@ where
     serde_json::from_value(data).map_err(HandleJsonResponseError::Deserialization)
 }
 
+#[derive(Debug)]
 struct ResponseValidatorState<'a> {
     responses: json::ValueRefs<'a>,
     branching: ResponseValidatorBranching<'a>,
@@ -1282,14 +1282,16 @@ fn handle_json_response_validate<'a>(
                 });
 
                 // From last to first, in order to pop from the first to last
-                responses
-                    .0
-                    .iter()
-                    .rev()
-                    .try_for_each(|response| {
-                        handle_json_response_validate_impl(response.into(), data_schema, &mut queue)
-                    })
-                    .or_else(|err| handle_response_validate_error(err, logic, &mut queue))?;
+                match responses.0.iter().rev().try_for_each(|response| {
+                    handle_json_response_validate_impl(response.into(), data_schema, &mut queue)
+                }) {
+                    Ok(()) => {
+                        if let ResponseValidatorLogic::Or { parent } = logic {
+                            queue.truncate(parent);
+                        }
+                    }
+                    Err(err) => handle_response_validate_error(err, logic, &mut queue)?,
+                }
             }
 
             ResponseValidatorBranching::Evaluated(..) => {}
@@ -3447,11 +3449,81 @@ mod tests {
                },
            )
            .unwrap_err(),
-           HandleJsonResponseRefError::Subtype {
-               expected: DataSchemaStatelessSubtype::Integer,
-               found: serde_json::Value::Number(found)
-           }
+           HandleJsonResponseRefError::IntegerSubtype (
+               NumericSubtypeError::InvalidType(found)
+           )
            if found.as_f64() == Some(3.5)
         ));
+    }
+
+    #[test]
+    fn validate_one_of() {
+        handle_json_response_validate(
+            json_ref!("hello"),
+            &DataSchema {
+                one_of: Some(vec![
+                    DataSchema {
+                        constant: Some(json!("hello")),
+                        ..Default::default()
+                    },
+                    DataSchema {
+                        constant: Some(json!("world")),
+                        ..Default::default()
+                    },
+                    DataSchema {
+                        constant: Some(json!(3)),
+                        ..Default::default()
+                    },
+                ]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        handle_json_response_validate(
+            json_ref!("world"),
+            &DataSchema {
+                one_of: Some(vec![
+                    DataSchema {
+                        constant: Some(json!("hello")),
+                        ..Default::default()
+                    },
+                    DataSchema {
+                        constant: Some(json!("world")),
+                        ..Default::default()
+                    },
+                    DataSchema {
+                        constant: Some(json!(3)),
+                        ..Default::default()
+                    },
+                ]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        handle_json_response_validate(
+            json_ref!(3),
+            &DataSchema {
+                one_of: Some(vec![
+                    DataSchema {
+                        constant: Some(json!("hello")),
+                        ..Default::default()
+                    },
+                    DataSchema {
+                        constant: Some(json!("world")),
+                        ..Default::default()
+                    },
+                    DataSchema {
+                        constant: Some(json!(3)),
+                        ..Default::default()
+                    },
+                ]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        todo!()
     }
 }

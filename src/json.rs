@@ -70,7 +70,23 @@ fn eq_numbers(a: &serde_json::Number, b: &serde_json::Number) -> bool {
         }
     }
 
-    todo!()
+    let a = Number::from(a);
+    let b = Number::from(b);
+
+    match (a, b) {
+        (Number::PosInt(a), Number::PosInt(b)) => a == b,
+        (Number::NegInt(a), Number::NegInt(b)) => a == b,
+        (Number::Float(a), Number::Float(b)) => a == b,
+        (Number::PosInt(a), Number::Float(b)) | (Number::Float(b), Number::PosInt(a)) => {
+            let a_f64 = a as f64;
+            a_f64 == b && a_f64 as u64 == a
+        }
+        (Number::NegInt(a), Number::Float(b)) | (Number::Float(b), Number::NegInt(a)) => {
+            let a_f64 = a as f64;
+            a_f64 == b && a_f64 as i64 == a
+        }
+        (Number::PosInt(_), Number::NegInt(_)) | (Number::NegInt(_), Number::PosInt(_)) => false,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -90,3 +106,115 @@ macro_rules! json_ref {
 }
 #[cfg(test)]
 pub(super) use json_ref;
+
+#[cfg(test)]
+mod tests {
+    use std::ops::Not;
+
+    use super::*;
+
+    #[test]
+    fn eq_numbers_positive() {
+        assert!(eq_numbers(&15u32.into(), &15i32.into()));
+        assert!(eq_numbers(&15u32.into(), &16u32.into()).not());
+    }
+
+    #[test]
+    fn eq_numbers_negative() {
+        assert!(eq_numbers(&(-15i32).into(), &(-15i64).into()));
+        assert!(eq_numbers(&(-15).into(), &(-16).into()).not());
+    }
+
+    #[test]
+    fn eq_numbers_float() {
+        use serde_json::Number;
+
+        assert!(eq_numbers(
+            &Number::from_f64(10.2).unwrap(),
+            &Number::from_f64(10.2).unwrap(),
+        ));
+        assert!(eq_numbers(
+            &Number::from_f64(10.2).unwrap(),
+            &Number::from_f64(10.3).unwrap(),
+        )
+        .not());
+    }
+
+    #[test]
+    fn eq_numbers_mixed_pos_neg() {
+        assert!(eq_numbers(&15u32.into(), &(-15i32).into()).not());
+        assert!(eq_numbers(&(-15i32).into(), &15i32.into()).not());
+    }
+
+    #[test]
+    fn eq_numbers_mixed_pos_float() {
+        use serde_json::Number;
+
+        assert!(eq_numbers(&15u32.into(), &Number::from_f64(15.0).unwrap()));
+        assert!(eq_numbers(
+            &u32::MAX.into(),
+            &Number::from_f64(u32::MAX.into()).unwrap()
+        ));
+
+        const REPRESENTABLE_IN_F64: u64 = 2u64.pow(f64::MANTISSA_DIGITS) + 2;
+        const NON_REPRESENTABLE_IN_F64: u64 = REPRESENTABLE_IN_F64 + 1;
+        // static assertion
+        let _: [u8; 1] =
+            [0; ((REPRESENTABLE_IN_F64 as f64 as u64) == REPRESENTABLE_IN_F64) as usize];
+        let _: [u8; 0] =
+            [0; ((NON_REPRESENTABLE_IN_F64 as f64 as u64) == NON_REPRESENTABLE_IN_F64) as usize];
+
+        assert!(eq_numbers(
+            &Number::from_f64(REPRESENTABLE_IN_F64 as f64).unwrap(),
+            &Number::from_f64(REPRESENTABLE_IN_F64 as f64).unwrap(),
+        ));
+        assert!(eq_numbers(
+            &Number::from_f64(NON_REPRESENTABLE_IN_F64 as f64).unwrap(),
+            &Number::from_f64(NON_REPRESENTABLE_IN_F64 as f64).unwrap(),
+        ));
+        assert!(eq_numbers(
+            &REPRESENTABLE_IN_F64.into(),
+            &Number::from_f64(REPRESENTABLE_IN_F64 as f64).unwrap(),
+        ));
+        assert!(eq_numbers(
+            &Number::from_f64(REPRESENTABLE_IN_F64 as f64).unwrap(),
+            &REPRESENTABLE_IN_F64.into(),
+        ));
+    }
+
+    #[test]
+    fn eq_numbers_mixed_neg_float() {
+        use serde_json::Number;
+
+        assert!(eq_numbers(&(-15).into(), &Number::from_f64(-15.0).unwrap()));
+        assert!(eq_numbers(
+            &i32::MIN.into(),
+            &Number::from_f64(i32::MIN.into()).unwrap()
+        ));
+
+        const REPRESENTABLE_IN_F64: i64 = -(2i64.pow(f64::MANTISSA_DIGITS)) - 2;
+        const NON_REPRESENTABLE_IN_F64: i64 = REPRESENTABLE_IN_F64 - 1;
+        // static assertion
+        let _: [u8; 1] =
+            [0; ((REPRESENTABLE_IN_F64 as f64 as i64) == REPRESENTABLE_IN_F64) as usize];
+        let _: [u8; 0] =
+            [0; ((NON_REPRESENTABLE_IN_F64 as f64 as i64) == NON_REPRESENTABLE_IN_F64) as usize];
+
+        assert!(eq_numbers(
+            &Number::from_f64(REPRESENTABLE_IN_F64 as f64).unwrap(),
+            &Number::from_f64(REPRESENTABLE_IN_F64 as f64).unwrap(),
+        ));
+        assert!(eq_numbers(
+            &Number::from_f64(NON_REPRESENTABLE_IN_F64 as f64).unwrap(),
+            &Number::from_f64(NON_REPRESENTABLE_IN_F64 as f64).unwrap(),
+        ));
+        assert!(eq_numbers(
+            &REPRESENTABLE_IN_F64.into(),
+            &Number::from_f64(REPRESENTABLE_IN_F64 as f64).unwrap(),
+        ));
+        assert!(eq_numbers(
+            &Number::from_f64(REPRESENTABLE_IN_F64 as f64).unwrap(),
+            &REPRESENTABLE_IN_F64.into(),
+        ));
+    }
+}
