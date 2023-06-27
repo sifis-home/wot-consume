@@ -13,7 +13,7 @@ use std::{
     marker::PhantomData,
     num::NonZeroU64,
     ops::{BitOr, Not},
-    rc::Rc,
+    rc::{self, Rc},
     slice,
     str::FromStr,
 };
@@ -406,7 +406,7 @@ pub struct UnsupportedSecuritySchemeSet(pub Vec<String>);
 pub struct AdditionalExpectedResponse {
     success: bool,
     content_type: Option<String>,
-    // TODO: should we use an `Arc`?
+    // TODO: should we use an `Arc`? Should be weak?
     schema: Option<Rc<DataSchema<(), (), ()>>>,
 }
 
@@ -1253,7 +1253,7 @@ fn handle_json_response_validate<'a>(
         responses,
         branching,
         logic,
-    }) = queue.pop()
+    }) = dbg!(queue.pop())
     {
         match branching {
             ResponseValidatorBranching::Unchecked(data_schema) => {
@@ -1265,6 +1265,8 @@ fn handle_json_response_validate<'a>(
                     )?;
                     continue;
                 }
+
+                dbg!(data_schema);
 
                 // Push eventual one_of before other validators, in order to pop it later
                 if let Some(one_of) = &data_schema.one_of {
@@ -1282,19 +1284,18 @@ fn handle_json_response_validate<'a>(
                 });
 
                 // From last to first, in order to pop from the first to last
-                match responses.0.iter().rev().try_for_each(|response| {
+                if let Err(err) = responses.0.iter().rev().try_for_each(|response| {
                     handle_json_response_validate_impl(response.into(), data_schema, &mut queue)
                 }) {
-                    Ok(()) => {
-                        if let ResponseValidatorLogic::Or { parent } = logic {
-                            queue.truncate(parent);
-                        }
-                    }
-                    Err(err) => handle_response_validate_error(err, logic, &mut queue)?,
+                    handle_response_validate_error(err, logic, &mut queue)?;
                 }
             }
 
-            ResponseValidatorBranching::Evaluated(..) => {}
+            ResponseValidatorBranching::Evaluated(..) => {
+                if let ResponseValidatorLogic::Or { parent } = dbg!(logic) {
+                    queue.truncate(parent);
+                }
+            }
 
             ResponseValidatorBranching::UnevaluatedOneOf(one_of) => {
                 let parent = queue.len();
@@ -1319,10 +1320,10 @@ fn handle_json_response_validate<'a>(
 
             ResponseValidatorBranching::EvaluatedOneOf(one_of) => {
                 handle_response_validate_error(
-                    HandleJsonResponseRefError::OneOf {
+                    dbg!(HandleJsonResponseRefError::OneOf {
                         expected: one_of,
                         found: response.0,
-                    },
+                    }),
                     logic,
                     &mut queue,
                 )?;
@@ -1431,11 +1432,11 @@ fn handle_json_response_validate_impl<'a, const N: usize>(
 
                 if let Some(items) = &data_schema.items {
                     match items {
-                        BoxedElemOrVec::Elem(elem) => queue.push(ResponseValidatorState {
+                        BoxedElemOrVec::Elem(elem) => queue.push(dbg!(ResponseValidatorState {
                             responses: responses.as_slice().into(),
                             branching: ResponseValidatorBranching::Unchecked(elem.as_ref()),
                             logic: ResponseValidatorLogic::And { parent },
-                        }),
+                        })),
                         BoxedElemOrVec::Vec(data_schemas) => {
                             // Note: we can have a different number of responses and data schemas.
                             //
@@ -3523,6 +3524,136 @@ mod tests {
             },
         )
         .unwrap();
+
+        assert!(matches!(
+            handle_json_response_validate(
+                json_ref!("nope"),
+                &DataSchema {
+                    one_of: Some(vec![
+                        DataSchema {
+                            constant: Some(json!("hello")),
+                            ..Default::default()
+                        },
+                        DataSchema {
+                            constant: Some(json!("world")),
+                            ..Default::default()
+                        },
+                        DataSchema {
+                            constant: Some(json!(3)),
+                            ..Default::default()
+                        },
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err(),
+            HandleJsonResponseRefError::OneOf {
+                expected: [
+                    DataSchema {
+                        constant: Some(serde_json::Value::String(const1)),
+                        ..
+                    },
+                    DataSchema {
+                        constant: Some(serde_json::Value::String(const2)),
+                        ..
+                    },
+                    DataSchema {
+                        constant: Some(serde_json::Value::Number(number)),
+                        ..
+                    },
+                ],
+                found: serde_json::Value::String(found),
+            }
+            if const1 == "hello"
+            && const2 == "world"
+            && number.as_u64() == Some(3)
+            && found == "nope"
+        ));
+
+        let chad_schema = DataSchema {
+            one_of: Some(vec![
+                DataSchema {
+                    subtype: Some(DataSchemaSubtype::Array(ArraySchema {
+                        items: Some(BoxedElemOrVec::Elem(Box::new(DataSchema {
+                            one_of: Some(vec![
+                                DataSchema {
+                                    subtype: Some(DataSchemaSubtype::Integer(
+                                        IntegerSchema::default(),
+                                    )),
+                                    ..Default::default()
+                                },
+                                DataSchema {
+                                    subtype: Some(DataSchemaSubtype::String(
+                                        StringSchema::default(),
+                                    )),
+                                    ..Default::default()
+                                },
+                            ]),
+                            ..Default::default()
+                        }))),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+                DataSchema {
+                    subtype: Some(DataSchemaSubtype::Array(ArraySchema {
+                        items: Some(BoxedElemOrVec::Elem(Box::new(DataSchema {
+                            one_of: Some(vec![
+                                DataSchema {
+                                    subtype: Some(DataSchemaSubtype::Integer(
+                                        IntegerSchema::default(),
+                                    )),
+                                    ..Default::default()
+                                },
+                                DataSchema {
+                                    subtype: Some(DataSchemaSubtype::Number(
+                                        NumberSchema::default(),
+                                    )),
+                                    ..Default::default()
+                                },
+                            ]),
+                            ..Default::default()
+                        }))),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+                DataSchema {
+                    subtype: Some(DataSchemaSubtype::Array(ArraySchema {
+                        items: Some(BoxedElemOrVec::Elem(Box::new(DataSchema {
+                            one_of: Some(vec![
+                                DataSchema {
+                                    subtype: Some(DataSchemaSubtype::Number(NumberSchema {
+                                        minimum: Some(Minimum::Inclusive(3.)),
+                                        ..Default::default()
+                                    })),
+                                    ..Default::default()
+                                },
+                                DataSchema {
+                                    subtype: Some(DataSchemaSubtype::String(
+                                        StringSchema::default(),
+                                    )),
+                                    ..Default::default()
+                                },
+                            ]),
+                            ..Default::default()
+                        }))),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+        handle_json_response_validate(json_ref!([3]), &chad_schema).unwrap();
+        handle_json_response_validate(json_ref!([3, 3.5]), &chad_schema).unwrap();
+        handle_json_response_validate(json_ref!([3, "pi"]), &chad_schema).unwrap();
+        handle_json_response_validate(json_ref!(["pi", 3.5]), &chad_schema).unwrap();
+        handle_json_response_validate(json_ref!(["pi", 3.5, 3]), &chad_schema).unwrap();
+        assert!(matches!(
+            handle_json_response_validate(json_ref!(["pi", 3.5, 2]), &chad_schema).unwrap_err(),
+            HandleJsonResponseRefError::OneOf { .. },
+        ));
 
         todo!()
     }
