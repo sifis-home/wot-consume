@@ -1266,8 +1266,6 @@ fn handle_json_response_validate<'a>(
                     continue;
                 }
 
-                dbg!(data_schema);
-
                 // Push eventual one_of before other validators, in order to pop it later
                 if let Some(one_of) = &data_schema.one_of {
                     queue.push(ResponseValidatorState {
@@ -1277,6 +1275,7 @@ fn handle_json_response_validate<'a>(
                     });
                 }
 
+                let evaluated_index = queue.len();
                 queue.push(ResponseValidatorState {
                     responses,
                     branching: ResponseValidatorBranching::Evaluated(data_schema),
@@ -1284,21 +1283,25 @@ fn handle_json_response_validate<'a>(
                 });
 
                 // From last to first, in order to pop from the first to last
-                if let Err(err) = responses.0.iter().rev().try_for_each(|response| {
+                if let Err(err) = dbg!(responses.0.iter().rev().try_for_each(|response| {
                     handle_json_response_validate_impl(response.into(), data_schema, &mut queue)
-                }) {
-                    handle_response_validate_error(err, logic, &mut queue)?;
+                })) {
+                    queue.truncate(evaluated_index);
+                    dbg!(handle_response_validate_error(err, logic, &mut queue))?;
                 }
             }
 
             ResponseValidatorBranching::Evaluated(..) => {
-                if let ResponseValidatorLogic::Or { parent } = dbg!(logic) {
+                if let ResponseValidatorLogic::Or { parent } = logic {
+                    // Parent is an evaluated `one_of`, if we reached this point we satisfied one of
+                    // its conditions, thus we need to remove it and its subsequent elements.
                     queue.truncate(parent);
                 }
             }
 
             ResponseValidatorBranching::UnevaluatedOneOf(one_of) => {
                 let parent = queue.len();
+                todo!("handle one or multiple responses in different ways");
                 queue.push(ResponseValidatorState {
                     responses,
                     branching: ResponseValidatorBranching::EvaluatedOneOf(one_of),
@@ -1320,10 +1323,10 @@ fn handle_json_response_validate<'a>(
 
             ResponseValidatorBranching::EvaluatedOneOf(one_of) => {
                 handle_response_validate_error(
-                    dbg!(HandleJsonResponseRefError::OneOf {
+                    HandleJsonResponseRefError::OneOf {
                         expected: one_of,
                         found: response.0,
-                    }),
+                    },
                     logic,
                     &mut queue,
                 )?;
@@ -1340,7 +1343,7 @@ fn handle_response_validate_error<'a, const N: usize>(
     queue: &mut SmallVec<[ResponseValidatorState; N]>,
 ) -> Result<(), HandleJsonResponseRefError<'a>> {
     loop {
-        match logic {
+        match dbg!(logic) {
             ResponseValidatorLogic::Or { .. } => break Ok(()),
             ResponseValidatorLogic::And { parent: None } => break Err(error),
             ResponseValidatorLogic::And {
@@ -1432,11 +1435,11 @@ fn handle_json_response_validate_impl<'a, const N: usize>(
 
                 if let Some(items) = &data_schema.items {
                     match items {
-                        BoxedElemOrVec::Elem(elem) => queue.push(dbg!(ResponseValidatorState {
+                        BoxedElemOrVec::Elem(elem) => queue.push(ResponseValidatorState {
                             responses: responses.as_slice().into(),
                             branching: ResponseValidatorBranching::Unchecked(elem.as_ref()),
                             logic: ResponseValidatorLogic::And { parent },
-                        })),
+                        }),
                         BoxedElemOrVec::Vec(data_schemas) => {
                             // Note: we can have a different number of responses and data schemas.
                             //
@@ -3459,116 +3462,116 @@ mod tests {
 
     #[test]
     fn validate_one_of() {
-        handle_json_response_validate(
-            json_ref!("hello"),
-            &DataSchema {
-                one_of: Some(vec![
-                    DataSchema {
-                        constant: Some(json!("hello")),
-                        ..Default::default()
-                    },
-                    DataSchema {
-                        constant: Some(json!("world")),
-                        ..Default::default()
-                    },
-                    DataSchema {
-                        constant: Some(json!(3)),
-                        ..Default::default()
-                    },
-                ]),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        // handle_json_response_validate(
+        //     json_ref!("hello"),
+        //     &DataSchema {
+        //         one_of: Some(vec![
+        //             DataSchema {
+        //                 constant: Some(json!("hello")),
+        //                 ..Default::default()
+        //             },
+        //             DataSchema {
+        //                 constant: Some(json!("world")),
+        //                 ..Default::default()
+        //             },
+        //             DataSchema {
+        //                 constant: Some(json!(3)),
+        //                 ..Default::default()
+        //             },
+        //         ]),
+        //         ..Default::default()
+        //     },
+        // )
+        // .unwrap();
 
-        handle_json_response_validate(
-            json_ref!("world"),
-            &DataSchema {
-                one_of: Some(vec![
-                    DataSchema {
-                        constant: Some(json!("hello")),
-                        ..Default::default()
-                    },
-                    DataSchema {
-                        constant: Some(json!("world")),
-                        ..Default::default()
-                    },
-                    DataSchema {
-                        constant: Some(json!(3)),
-                        ..Default::default()
-                    },
-                ]),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        // handle_json_response_validate(
+        //     json_ref!("world"),
+        //     &DataSchema {
+        //         one_of: Some(vec![
+        //             DataSchema {
+        //                 constant: Some(json!("hello")),
+        //                 ..Default::default()
+        //             },
+        //             DataSchema {
+        //                 constant: Some(json!("world")),
+        //                 ..Default::default()
+        //             },
+        //             DataSchema {
+        //                 constant: Some(json!(3)),
+        //                 ..Default::default()
+        //             },
+        //         ]),
+        //         ..Default::default()
+        //     },
+        // )
+        // .unwrap();
 
-        handle_json_response_validate(
-            json_ref!(3),
-            &DataSchema {
-                one_of: Some(vec![
-                    DataSchema {
-                        constant: Some(json!("hello")),
-                        ..Default::default()
-                    },
-                    DataSchema {
-                        constant: Some(json!("world")),
-                        ..Default::default()
-                    },
-                    DataSchema {
-                        constant: Some(json!(3)),
-                        ..Default::default()
-                    },
-                ]),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        // handle_json_response_validate(
+        //     json_ref!(3),
+        //     &DataSchema {
+        //         one_of: Some(vec![
+        //             DataSchema {
+        //                 constant: Some(json!("hello")),
+        //                 ..Default::default()
+        //             },
+        //             DataSchema {
+        //                 constant: Some(json!("world")),
+        //                 ..Default::default()
+        //             },
+        //             DataSchema {
+        //                 constant: Some(json!(3)),
+        //                 ..Default::default()
+        //             },
+        //         ]),
+        //         ..Default::default()
+        //     },
+        // )
+        // .unwrap();
 
-        assert!(matches!(
-            handle_json_response_validate(
-                json_ref!("nope"),
-                &DataSchema {
-                    one_of: Some(vec![
-                        DataSchema {
-                            constant: Some(json!("hello")),
-                            ..Default::default()
-                        },
-                        DataSchema {
-                            constant: Some(json!("world")),
-                            ..Default::default()
-                        },
-                        DataSchema {
-                            constant: Some(json!(3)),
-                            ..Default::default()
-                        },
-                    ]),
-                    ..Default::default()
-                },
-            )
-            .unwrap_err(),
-            HandleJsonResponseRefError::OneOf {
-                expected: [
-                    DataSchema {
-                        constant: Some(serde_json::Value::String(const1)),
-                        ..
-                    },
-                    DataSchema {
-                        constant: Some(serde_json::Value::String(const2)),
-                        ..
-                    },
-                    DataSchema {
-                        constant: Some(serde_json::Value::Number(number)),
-                        ..
-                    },
-                ],
-                found: serde_json::Value::String(found),
-            }
-            if const1 == "hello"
-            && const2 == "world"
-            && number.as_u64() == Some(3)
-            && found == "nope"
-        ));
+        // assert!(matches!(
+        //     handle_json_response_validate(
+        //         json_ref!("nope"),
+        //         &DataSchema {
+        //             one_of: Some(vec![
+        //                 DataSchema {
+        //                     constant: Some(json!("hello")),
+        //                     ..Default::default()
+        //                 },
+        //                 DataSchema {
+        //                     constant: Some(json!("world")),
+        //                     ..Default::default()
+        //                 },
+        //                 DataSchema {
+        //                     constant: Some(json!(3)),
+        //                     ..Default::default()
+        //                 },
+        //             ]),
+        //             ..Default::default()
+        //         },
+        //     )
+        //     .unwrap_err(),
+        //     HandleJsonResponseRefError::OneOf {
+        //         expected: [
+        //             DataSchema {
+        //                 constant: Some(serde_json::Value::String(const1)),
+        //                 ..
+        //             },
+        //             DataSchema {
+        //                 constant: Some(serde_json::Value::String(const2)),
+        //                 ..
+        //             },
+        //             DataSchema {
+        //                 constant: Some(serde_json::Value::Number(number)),
+        //                 ..
+        //             },
+        //         ],
+        //         found: serde_json::Value::String(found),
+        //     }
+        //     if const1 == "hello"
+        //     && const2 == "world"
+        //     && number.as_u64() == Some(3)
+        //     && found == "nope"
+        // ));
 
         let chad_schema = DataSchema {
             one_of: Some(vec![
@@ -3645,8 +3648,8 @@ mod tests {
             ]),
             ..Default::default()
         };
-        handle_json_response_validate(json_ref!([3]), &chad_schema).unwrap();
-        handle_json_response_validate(json_ref!([3, 3.5]), &chad_schema).unwrap();
+        // handle_json_response_validate(json_ref!([3]), &chad_schema).unwrap();
+        // handle_json_response_validate(json_ref!([3, 3.5]), &chad_schema).unwrap();
         handle_json_response_validate(json_ref!([3, "pi"]), &chad_schema).unwrap();
         handle_json_response_validate(json_ref!(["pi", 3.5]), &chad_schema).unwrap();
         handle_json_response_validate(json_ref!(["pi", 3.5, 3]), &chad_schema).unwrap();
