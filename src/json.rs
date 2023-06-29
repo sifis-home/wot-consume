@@ -92,6 +92,14 @@ fn eq_numbers(a: &serde_json::Number, b: &serde_json::Number) -> bool {
 #[derive(Debug, Clone, Copy)]
 pub struct ValueRefs<'a>(pub &'a [serde_json::Value]);
 
+impl<'a> ValueRefs<'a> {
+    pub fn split_first(&self) -> Option<(ValueRef<'a>, ValueRefs<'a>)> {
+        self.0
+            .split_first()
+            .map(|(first, rest)| (ValueRef(first), ValueRefs(rest)))
+    }
+}
+
 impl<'a> From<&'a [serde_json::Value]> for ValueRefs<'a> {
     fn from(value: &'a [serde_json::Value]) -> Self {
         Self(value)

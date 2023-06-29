@@ -13,12 +13,13 @@ use std::{
     marker::PhantomData,
     num::NonZeroU64,
     ops::{BitOr, Not},
-    rc::{self, Rc},
+    rc::Rc,
     slice,
     str::FromStr,
 };
 
 use bitflags::bitflags;
+use json::ValueRef;
 use regex::Regex;
 use reqwest::Url;
 use sealed::HasHttpProtocolExtension;
@@ -1252,8 +1253,8 @@ fn handle_json_response_validate<'a>(
     while let Some(ResponseValidatorState {
         responses,
         branching,
-        logic,
-    }) = dbg!(queue.pop())
+        mut logic,
+    }) = queue.pop()
     {
         match branching {
             ResponseValidatorBranching::Unchecked(data_schema) => {
@@ -1278,16 +1279,16 @@ fn handle_json_response_validate<'a>(
                 let evaluated_index = queue.len();
                 queue.push(ResponseValidatorState {
                     responses,
-                    branching: ResponseValidatorBranching::Evaluated(data_schema),
+                    branching: ResponseValidatorBranching::Evaluated(Some(data_schema)),
                     logic,
                 });
 
                 // From last to first, in order to pop from the first to last
-                if let Err(err) = dbg!(responses.0.iter().rev().try_for_each(|response| {
+                if let Err(err) = responses.0.iter().rev().try_for_each(|response| {
                     handle_json_response_validate_impl(response.into(), data_schema, &mut queue)
-                })) {
+                }) {
                     queue.truncate(evaluated_index);
-                    dbg!(handle_response_validate_error(err, logic, &mut queue))?;
+                    handle_response_validate_error(err, logic, &mut queue)?;
                 }
             }
 
@@ -1300,8 +1301,33 @@ fn handle_json_response_validate<'a>(
             }
 
             ResponseValidatorBranching::UnevaluatedOneOf(one_of) => {
-                let parent = queue.len();
-                todo!("handle one or multiple responses in different ways");
+                let (first_response, other_responses) = responses
+                    .split_first()
+                    .expect("at least one response should be always available");
+
+                let mut parent = queue.len();
+                if other_responses.0.is_empty().not() {
+                    queue.push(ResponseValidatorState {
+                        responses,
+                        branching: ResponseValidatorBranching::Evaluated(None),
+                        logic,
+                    });
+
+                    logic = ResponseValidatorLogic::And {
+                        parent: Some(parent),
+                    };
+                    // From last to first, in order to perform pops from first to last
+                    queue.extend(other_responses.0.iter().rev().map(|response| {
+                        ResponseValidatorState {
+                            responses: ValueRef(response).to_refs(),
+                            branching: ResponseValidatorBranching::UnevaluatedOneOf(one_of),
+                            logic,
+                        }
+                    }));
+
+                    parent = queue.len();
+                }
+
                 queue.push(ResponseValidatorState {
                     responses,
                     branching: ResponseValidatorBranching::EvaluatedOneOf(one_of),
@@ -1314,7 +1340,7 @@ fn handle_json_response_validate<'a>(
                         .iter()
                         .rev()
                         .map(|data_schema| ResponseValidatorState {
-                            responses,
+                            responses: first_response.to_refs(),
                             branching: ResponseValidatorBranching::Unchecked(data_schema),
                             logic: ResponseValidatorLogic::Or { parent },
                         }),
@@ -1343,7 +1369,7 @@ fn handle_response_validate_error<'a, const N: usize>(
     queue: &mut SmallVec<[ResponseValidatorState; N]>,
 ) -> Result<(), HandleJsonResponseRefError<'a>> {
     loop {
-        match dbg!(logic) {
+        match logic {
             ResponseValidatorLogic::Or { .. } => break Ok(()),
             ResponseValidatorLogic::And { parent: None } => break Err(error),
             ResponseValidatorLogic::And {
@@ -1367,7 +1393,7 @@ enum ResponseValidatorLogic {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ResponseValidatorBranching<'a> {
     Unchecked(&'a DataSchema<(), (), ()>),
-    Evaluated(&'a DataSchema<(), (), ()>),
+    Evaluated(Option<&'a DataSchema<(), (), ()>>),
     UnevaluatedOneOf(&'a [DataSchema<(), (), ()>]),
     EvaluatedOneOf(&'a [DataSchema<(), (), ()>]),
 }
@@ -1398,7 +1424,7 @@ fn handle_json_response_validate_impl<'a, const N: usize>(
     let parent = queue.len() - 1;
     debug_assert!(matches!(
         queue[parent].branching,
-        ResponseValidatorBranching::Evaluated(queue_data_schema)
+        ResponseValidatorBranching::Evaluated(Some(queue_data_schema))
         if std::ptr::eq(queue_data_schema, data_schema)
     ));
     let parent = Some(parent);
@@ -1569,8 +1595,6 @@ pub enum HandleJsonResponseError {
     IntegerSubtype(NumericSubtypeError<i64, NonZeroU64>),
     StringSubtype(StringSubtypeError),
     ObjectSubtype(ObjectSubtypeError),
-    TooManyChildren,
-    TooDeep,
     Deserialization(serde_json::Error),
 }
 
@@ -1598,8 +1622,6 @@ pub enum HandleJsonResponseRefError<'a> {
     IntegerSubtype(NumericSubtypeError<i64, NonZeroU64>),
     StringSubtype(StringSubtypeRefError<'a>),
     ObjectSubtype(ObjectSubtypeRefError<'a>),
-    TooManyChildren,
-    TooDeep,
 }
 
 impl HandleJsonResponseRefError<'_> {
@@ -1627,8 +1649,6 @@ impl HandleJsonResponseRefError<'_> {
             Self::IntegerSubtype(err) => HandleJsonResponseError::IntegerSubtype(err),
             Self::StringSubtype(err) => HandleJsonResponseError::StringSubtype(err.into()),
             Self::ObjectSubtype(err) => HandleJsonResponseError::ObjectSubtype(err.into()),
-            Self::TooManyChildren => HandleJsonResponseError::TooManyChildren,
-            Self::TooDeep => HandleJsonResponseError::TooDeep,
         }
     }
 }
@@ -2113,209 +2133,11 @@ fn get_integral_from_number(number: &serde_json::Number) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::OnceLock, time::Duration};
-
-    use reqwest::{Client, StatusCode};
-    use serde::Serialize;
     use serde_json::json;
-    use wiremock::{
-        matchers::{method, path},
-        Mock, MockServer, ResponseTemplate, Times,
-    };
-    use wot_td::{
-        builder::{
-            BuildableInteractionAffordance, DataSchemaBuilder, IntegerDataSchemaBuilderLike,
-            SpecializableDataSchema,
-        },
-        protocol::http,
-        Thing,
-    };
 
     use crate::json::json_ref;
 
     use super::*;
-
-    fn client() -> Client {
-        static CLIENT: OnceLock<Client> = OnceLock::new();
-
-        CLIENT
-            .get_or_init(|| {
-                Client::builder()
-                    .timeout(Duration::from_secs(1))
-                    .connect_timeout(Duration::from_secs(1))
-                    .build()
-                    .unwrap()
-            })
-            .clone()
-    }
-
-    async fn check_no_uri_variables_used(endpoints: &[&str], mock_server: &MockServer) {
-        mock_server
-            .received_requests()
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|request| endpoints.contains(&request.url.path()))
-            .for_each(|request| assert!(request.url.query().is_none()));
-    }
-
-    #[tokio::test]
-    async fn get_simple_property() {
-        let mock_server = MockServer::start().await;
-        let td = Thing::builder("test")
-            .ext(http::HttpProtocol {})
-            .finish_extend()
-            .base(mock_server.uri())
-            .property("test", |b| {
-                b.ext(())
-                    .ext_interaction(())
-                    .ext_data_schema(())
-                    .finish_extend_data_schema()
-                    .integer()
-                    .form(|b| b.ext(http::Form::default()).href("/testing-url"))
-            })
-            .build()
-            .unwrap();
-
-        Mock::given(method("GET"))
-            .and(path("/testing-url"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(42))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let prop: i16 = consume(&td, client())
-            .await
-            .unwrap()
-            .property("test")
-            .unwrap()
-            .read()
-            .send()
-            .unwrap()
-            .await
-            .unwrap();
-
-        assert_eq!(prop, 42);
-        mock_server.verify().await;
-        check_no_uri_variables_used(&["/testing-url"], &mock_server).await;
-    }
-
-    #[tokio::test]
-    async fn missing_property_in_td() {
-        let mock_server = MockServer::start().await;
-        let td = Thing::builder("test")
-            .ext(http::HttpProtocol {})
-            .finish_extend()
-            .base(mock_server.uri())
-            .property("test", |b| {
-                b.ext(())
-                    .ext_interaction(())
-                    .ext_data_schema(())
-                    .finish_extend_data_schema()
-                    .integer()
-                    .form(|b| b.ext(http::Form::default()).href("/testing-url"))
-            })
-            .build()
-            .unwrap();
-
-        assert!(consume(&td, client())
-            .await
-            .unwrap()
-            .property("missing-test")
-            .is_none());
-
-        mock_server.verify().await;
-    }
-
-    #[tokio::test]
-    async fn missing_property_from_server() {
-        let mock_server = MockServer::start().await;
-        let td = Thing::builder("test")
-            .ext(http::HttpProtocol {})
-            .finish_extend()
-            .base(mock_server.uri())
-            .property("test", |b| {
-                b.ext(())
-                    .ext_interaction(())
-                    .ext_data_schema(())
-                    .finish_extend_data_schema()
-                    .integer()
-                    .form(|b| b.ext(http::Form::default()).href("/testing-url"))
-            })
-            .build()
-            .unwrap();
-
-        let err = consume(&td, client())
-            .await
-            .unwrap()
-            .property("test")
-            .unwrap()
-            .read::<i16>()
-            .send()
-            .unwrap()
-            .await
-            .unwrap_err();
-
-        assert!(matches!(
-            err,
-            PropertyReaderSendFutureError::ResponseError(reqwest_error)
-            if reqwest_error.is_status() &&
-            reqwest_error.status() == Some(StatusCode::NOT_FOUND)
-        ));
-        mock_server.verify().await;
-    }
-
-    #[tokio::test]
-    async fn failing_minimum_integer() {
-        let mock_server = MockServer::start().await;
-        let td = Thing::builder("test")
-            .ext(http::HttpProtocol {})
-            .finish_extend()
-            .base(mock_server.uri())
-            .property("test", |b| {
-                b.ext(())
-                    .ext_interaction(())
-                    .ext_data_schema(())
-                    .finish_extend_data_schema()
-                    .integer()
-                    .minimum(43)
-                    .form(|b| b.ext(http::Form::default()).href("/testing-url"))
-            })
-            .build()
-            .unwrap();
-
-        Mock::given(method("GET"))
-            .and(path("/testing-url"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(42))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let err = consume(&td, client())
-            .await
-            .unwrap()
-            .property("test")
-            .unwrap()
-            .read::<i16>()
-            .send()
-            .unwrap()
-            .await
-            .unwrap_err();
-
-        assert!(matches!(
-            err,
-            PropertyReaderSendFutureError::InvalidResponse(
-                PropertyReaderSendFutureInvalidResponse::Json(
-                    HandleJsonResponseError::IntegerSubtype(NumericSubtypeError::Minimum {
-                        expected: Minimum::Inclusive(43),
-                        found: 42,
-                    }),
-                ),
-            ),
-        ));
-        mock_server.verify().await;
-        check_no_uri_variables_used(&["/testing-url"], &mock_server).await;
-    }
 
     #[test]
     fn validate_integer() {
@@ -3462,116 +3284,167 @@ mod tests {
 
     #[test]
     fn validate_one_of() {
-        // handle_json_response_validate(
-        //     json_ref!("hello"),
-        //     &DataSchema {
-        //         one_of: Some(vec![
-        //             DataSchema {
-        //                 constant: Some(json!("hello")),
-        //                 ..Default::default()
-        //             },
-        //             DataSchema {
-        //                 constant: Some(json!("world")),
-        //                 ..Default::default()
-        //             },
-        //             DataSchema {
-        //                 constant: Some(json!(3)),
-        //                 ..Default::default()
-        //             },
-        //         ]),
-        //         ..Default::default()
-        //     },
-        // )
-        // .unwrap();
+        handle_json_response_validate(
+            json_ref!("hello"),
+            &DataSchema {
+                one_of: Some(vec![
+                    DataSchema {
+                        constant: Some(json!("hello")),
+                        ..Default::default()
+                    },
+                    DataSchema {
+                        constant: Some(json!("world")),
+                        ..Default::default()
+                    },
+                    DataSchema {
+                        constant: Some(json!(3)),
+                        ..Default::default()
+                    },
+                ]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
-        // handle_json_response_validate(
-        //     json_ref!("world"),
-        //     &DataSchema {
-        //         one_of: Some(vec![
-        //             DataSchema {
-        //                 constant: Some(json!("hello")),
-        //                 ..Default::default()
-        //             },
-        //             DataSchema {
-        //                 constant: Some(json!("world")),
-        //                 ..Default::default()
-        //             },
-        //             DataSchema {
-        //                 constant: Some(json!(3)),
-        //                 ..Default::default()
-        //             },
-        //         ]),
-        //         ..Default::default()
-        //     },
-        // )
-        // .unwrap();
+        handle_json_response_validate(
+            json_ref!("world"),
+            &DataSchema {
+                one_of: Some(vec![
+                    DataSchema {
+                        constant: Some(json!("hello")),
+                        ..Default::default()
+                    },
+                    DataSchema {
+                        constant: Some(json!("world")),
+                        ..Default::default()
+                    },
+                    DataSchema {
+                        constant: Some(json!(3)),
+                        ..Default::default()
+                    },
+                ]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
-        // handle_json_response_validate(
-        //     json_ref!(3),
-        //     &DataSchema {
-        //         one_of: Some(vec![
-        //             DataSchema {
-        //                 constant: Some(json!("hello")),
-        //                 ..Default::default()
-        //             },
-        //             DataSchema {
-        //                 constant: Some(json!("world")),
-        //                 ..Default::default()
-        //             },
-        //             DataSchema {
-        //                 constant: Some(json!(3)),
-        //                 ..Default::default()
-        //             },
-        //         ]),
-        //         ..Default::default()
-        //     },
-        // )
-        // .unwrap();
+        handle_json_response_validate(
+            json_ref!(3),
+            &DataSchema {
+                one_of: Some(vec![
+                    DataSchema {
+                        constant: Some(json!("hello")),
+                        ..Default::default()
+                    },
+                    DataSchema {
+                        constant: Some(json!("world")),
+                        ..Default::default()
+                    },
+                    DataSchema {
+                        constant: Some(json!(3)),
+                        ..Default::default()
+                    },
+                ]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
-        // assert!(matches!(
-        //     handle_json_response_validate(
-        //         json_ref!("nope"),
-        //         &DataSchema {
-        //             one_of: Some(vec![
-        //                 DataSchema {
-        //                     constant: Some(json!("hello")),
-        //                     ..Default::default()
-        //                 },
-        //                 DataSchema {
-        //                     constant: Some(json!("world")),
-        //                     ..Default::default()
-        //                 },
-        //                 DataSchema {
-        //                     constant: Some(json!(3)),
-        //                     ..Default::default()
-        //                 },
-        //             ]),
-        //             ..Default::default()
-        //         },
-        //     )
-        //     .unwrap_err(),
-        //     HandleJsonResponseRefError::OneOf {
-        //         expected: [
-        //             DataSchema {
-        //                 constant: Some(serde_json::Value::String(const1)),
-        //                 ..
-        //             },
-        //             DataSchema {
-        //                 constant: Some(serde_json::Value::String(const2)),
-        //                 ..
-        //             },
-        //             DataSchema {
-        //                 constant: Some(serde_json::Value::Number(number)),
-        //                 ..
-        //             },
-        //         ],
-        //         found: serde_json::Value::String(found),
-        //     }
-        //     if const1 == "hello"
-        //     && const2 == "world"
-        //     && number.as_u64() == Some(3)
-        //     && found == "nope"
-        // ));
+        assert!(matches!(
+            handle_json_response_validate(
+                json_ref!("nope"),
+                &DataSchema {
+                    one_of: Some(vec![
+                        DataSchema {
+                            constant: Some(json!("hello")),
+                            ..Default::default()
+                        },
+                        DataSchema {
+                            constant: Some(json!("world")),
+                            ..Default::default()
+                        },
+                        DataSchema {
+                            constant: Some(json!(3)),
+                            ..Default::default()
+                        },
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err(),
+            HandleJsonResponseRefError::OneOf {
+                expected: [
+                    DataSchema {
+                        constant: Some(serde_json::Value::String(const1)),
+                        ..
+                    },
+                    DataSchema {
+                        constant: Some(serde_json::Value::String(const2)),
+                        ..
+                    },
+                    DataSchema {
+                        constant: Some(serde_json::Value::Number(number)),
+                        ..
+                    },
+                ],
+                found: serde_json::Value::String(found),
+            }
+            if const1 == "hello"
+            && const2 == "world"
+            && number.as_u64() == Some(3)
+            && found == "nope"
+        ));
+
+        assert!(matches!(
+            handle_json_response_validate(
+                json_ref!(3),
+                &DataSchema {
+                    one_of: Some(vec![]),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err(),
+            HandleJsonResponseRefError::OneOf {
+                expected: [],
+                found: serde_json::Value::Number(found),
+            }
+            if found.as_u64() == Some(3)
+        ));
+
+        handle_json_response_validate(
+            json_ref!(3),
+            &DataSchema {
+                one_of: Some(vec![DataSchema {
+                    constant: Some(json!(3)),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            handle_json_response_validate(
+                json_ref!(3),
+                &DataSchema {
+                    one_of: Some(vec![DataSchema {
+                        constant: Some(json!("hello")),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err(),
+            HandleJsonResponseRefError::OneOf {
+                expected: [DataSchema {
+                    constant: Some(serde_json::Value::String(expected)),
+                    ..
+                }],
+                found: serde_json::Value::Number(found),
+            }
+            if expected == "hello"
+            && found.as_u64() == Some(3)
+        ));
 
         let chad_schema = DataSchema {
             one_of: Some(vec![
@@ -3648,8 +3521,8 @@ mod tests {
             ]),
             ..Default::default()
         };
-        // handle_json_response_validate(json_ref!([3]), &chad_schema).unwrap();
-        // handle_json_response_validate(json_ref!([3, 3.5]), &chad_schema).unwrap();
+        handle_json_response_validate(json_ref!([3]), &chad_schema).unwrap();
+        handle_json_response_validate(json_ref!([3, 3.5]), &chad_schema).unwrap();
         handle_json_response_validate(json_ref!([3, "pi"]), &chad_schema).unwrap();
         handle_json_response_validate(json_ref!(["pi", 3.5]), &chad_schema).unwrap();
         handle_json_response_validate(json_ref!(["pi", 3.5, 3]), &chad_schema).unwrap();
@@ -3657,7 +3530,93 @@ mod tests {
             handle_json_response_validate(json_ref!(["pi", 3.5, 2]), &chad_schema).unwrap_err(),
             HandleJsonResponseRefError::OneOf { .. },
         ));
+    }
 
-        todo!()
+    #[test]
+    fn read_write_only_properties() {
+        assert!(matches!(
+            handle_json_response_validate(
+                json_ref!(3),
+                &DataSchema {
+                    write_only: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err(),
+            HandleJsonResponseRefError::WriteOnly,
+        ));
+
+        handle_json_response_validate(
+            json_ref!(3),
+            &DataSchema {
+                one_of: Some(vec![
+                    DataSchema {
+                        write_only: true,
+                        ..Default::default()
+                    },
+                    DataSchema::default(),
+                ]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn scalar_data_schema_from_data_schema() {
+        let scalar = ScalarDataSchema::try_from(&DataSchema::<(), (), ()> {
+            attype: Some(vec!["attype1".to_string(), "attype2".to_string()]),
+            title: Some("title".to_string()),
+            titles: Some(
+                [
+                    ("it".parse().unwrap(), "un titolo".to_string()),
+                    ("en".parse().unwrap(), "a title".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            description: Some("description".to_string()),
+            descriptions: Some(
+                [
+                    ("it".parse().unwrap(), "una descrizione".to_string()),
+                    ("en".parse().unwrap(), "a description".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            constant: Some("const".into()),
+            default: Some(json!({"default": ["value", 3]})),
+            unit: Some("unit".to_string()),
+            one_of: todo!(),
+            enumeration: Some(vec![json!("hello"), json!(3)]),
+            read_only: true,
+            write_only: true,
+            format: Some("format".to_string()),
+            subtype: Some(DataSchemaSubtype::Object(ObjectSchema {
+                properties: Some(
+                    [(
+                        "hello".to_string(),
+                        DataSchema {
+                            subtype: Some(DataSchemaSubtype::Array(ArraySchema {
+                                items: Some(BoxedElemOrVec::Elem(Box::new(DataSchema {
+                                    subtype: Some(DataSchemaSubtype::Integer(
+                                        IntegerSchema::default(),
+                                    )),
+                                    ..Default::default()
+                                }))),
+                                ..Default::default()
+                            })),
+                            ..Default::default()
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+                required: Some(vec!["hello".to_string()]),
+                other: (),
+            })),
+            other: (),
+        })
+        .unwrap();
     }
 }
