@@ -6,8 +6,8 @@ use wiremock::{
     Mock, MockServer, ResponseTemplate,
 };
 use wot_consume::{
-    consume, HandleJsonResponseError, NumericSubtypeError, PropertyReaderSendFutureError,
-    PropertyReaderSendFutureInvalidResponse,
+    consume, HandleJsonResponseError, NumericSubtypeError, PerformRequestError,
+    PerformRequestInvalidResponse,
 };
 use wot_td::{
     builder::{
@@ -141,7 +141,7 @@ async fn missing_property_from_server() {
 
     assert!(matches!(
         err,
-        PropertyReaderSendFutureError::ResponseError(reqwest_error)
+        PerformRequestError::ResponseError(reqwest_error)
         if reqwest_error.is_status() &&
         reqwest_error.status() == Some(StatusCode::NOT_FOUND)
     ));
@@ -187,14 +187,12 @@ async fn failing_minimum_integer() {
 
     assert!(matches!(
         err,
-        PropertyReaderSendFutureError::InvalidResponse(
-            PropertyReaderSendFutureInvalidResponse::Json(HandleJsonResponseError::IntegerSubtype(
-                NumericSubtypeError::Minimum {
-                    expected: Minimum::Inclusive(43),
-                    found: 42,
-                }
-            ),),
-        ),
+        PerformRequestError::InvalidResponse(PerformRequestInvalidResponse::Json(
+            HandleJsonResponseError::IntegerSubtype(NumericSubtypeError::Minimum {
+                expected: Minimum::Inclusive(43),
+                found: 42,
+            }),
+        ),),
     ));
     mock_server.verify().await;
     check_no_uri_variables_used(&["/testing-url"], &mock_server).await;

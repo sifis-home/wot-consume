@@ -8,6 +8,7 @@ mod sealed;
 
 use std::{
     convert::identity,
+    error::Error as StdError,
     fmt::{self, Display},
     future::Future,
     marker::PhantomData,
@@ -37,6 +38,131 @@ use wot_td::{
     Thing,
 };
 use zeroize::{Zeroize, ZeroizeOnDrop};
+
+pub async fn get_thing_description(
+    client: &reqwest::Client,
+    host: &str,
+    port: Option<u16>,
+) -> Result<Thing, GetThingDescriptionError> {
+    macro_rules! err {
+        ($kind:expr) => {
+            GetThingDescriptionError {
+                host: host.to_owned(),
+                kind: $kind,
+            }
+        };
+    }
+
+    let mut url: Url = host
+        .parse()
+        .map_err(|source| err!(GetThingDescriptionErrorKind::InvalidHost(source)))?;
+
+    if url.path() != "/" {
+        return Err(err!(GetThingDescriptionErrorKind::UrlHasPath));
+    }
+
+    match port {
+        None | Some(443) => url
+            .set_scheme("https")
+            .map_err(|()| err!(GetThingDescriptionErrorKind::CannotSetScheme("https")))?,
+        Some(port) => {
+            url.set_scheme("http")
+                .map_err(|()| err!(GetThingDescriptionErrorKind::CannotSetScheme("http")))?;
+            url.set_port(Some(port))
+                .map_err(|()| err!(GetThingDescriptionErrorKind::CannotSetPort(port)))?;
+        }
+    }
+
+    url.set_path(".well-known/wot");
+
+    client
+        .get(url)
+        .send()
+        .await
+        .map_err(|source| err!(GetThingDescriptionErrorKind::Request(source)))?
+        .error_for_status()
+        .map_err(|source| err!(GetThingDescriptionErrorKind::RequestStatus(source)))?
+        .json()
+        .await
+        .map_err(|source| err!(GetThingDescriptionErrorKind::InvalidThing(source)))
+}
+
+#[derive(Debug)]
+pub struct GetThingDescriptionError {
+    pub host: String,
+    pub kind: GetThingDescriptionErrorKind,
+}
+
+#[derive(Debug)]
+pub enum GetThingDescriptionErrorKind {
+    UrlHasPath,
+    InvalidHost(url::ParseError),
+    CannotSetScheme(&'static str),
+    CannotSetPort(u16),
+    Request(reqwest::Error),
+    RequestStatus(reqwest::Error),
+    InvalidThing(reqwest::Error),
+}
+
+impl Display for GetThingDescriptionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn write_init<'a, 'b>(
+            err: &GetThingDescriptionError,
+            f: &'a mut fmt::Formatter<'b>,
+        ) -> Result<&'a mut fmt::Formatter<'b>, fmt::Error> {
+            write!(
+                f,
+                r#"unable to get thing description from host "{}", "#,
+                err.host
+            )?;
+
+            Ok(f)
+        }
+
+        match &self.kind {
+            GetThingDescriptionErrorKind::UrlHasPath => write!(
+                f,
+                r#"unable to get thing description, "{}" is an url with a non-empty path"#,
+                self.host
+            ),
+            GetThingDescriptionErrorKind::InvalidHost(_) => write!(
+                f,
+                r#"unable to get thing description, "{}" is not a valid host"#,
+                self.host
+            ),
+            GetThingDescriptionErrorKind::CannotSetScheme(scheme) => write!(
+                write_init(self, f)?,
+                r#"unable to set scheme to "{scheme}""#
+            ),
+            GetThingDescriptionErrorKind::CannotSetPort(port) => {
+                write!(write_init(self, f)?, r#"unable to set port to "{port}""#)
+            }
+            GetThingDescriptionErrorKind::Request(_) => {
+                write_init(self, f)?.write_str("request failed")
+            }
+            GetThingDescriptionErrorKind::RequestStatus(_) => {
+                write_init(self, f)?.write_str("request returned an error status")
+            }
+            GetThingDescriptionErrorKind::InvalidThing(_) => {
+                write_init(self, f)?.write_str("cannot deserialize response as a thing description")
+            }
+        }
+    }
+}
+
+impl StdError for GetThingDescriptionError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match &self.kind {
+            GetThingDescriptionErrorKind::InvalidHost(source) => Some(source),
+            GetThingDescriptionErrorKind::Request(source)
+            | GetThingDescriptionErrorKind::RequestStatus(source)
+            | GetThingDescriptionErrorKind::InvalidThing(source) => Some(source),
+            GetThingDescriptionErrorKind::UrlHasPath
+            | GetThingDescriptionErrorKind::CannotSetScheme(_)
+            | GetThingDescriptionErrorKind::CannotSetPort(_) => None,
+        }
+    }
+}
 
 pub async fn consume<Other>(
     td: &Thing<Other>,
@@ -156,12 +282,74 @@ where
         },
     )?;
 
+    let thing_level_forms = td
+        .forms
+        .as_ref()
+        .map(|forms| {
+            forms
+                .iter()
+                .filter_map(|form| match &form.op {
+                    DefaultedFormOperations::Default => {
+                        return Some(Err(ThingLevelFormError {
+                            href: form.href.clone(),
+                            kind: ThingLevelFormErrorKind::InvalidDefault,
+                        }))
+                    }
+                    DefaultedFormOperations::Custom(ops) => {
+                        let (&op, ops) = ops.split_first()?;
+
+                        if ops.is_empty().not() {
+                            return Some(Err(ThingLevelFormError {
+                                href: form.href.clone(),
+                                kind: ThingLevelFormErrorKind::MultipleOps,
+                            }));
+                        }
+
+                        Some(match op {
+                            FormOperation::ReadAllProperties
+                            | FormOperation::WriteAllProperties
+                            | FormOperation::ReadMultipleProperties
+                            | FormOperation::WriteMultipleProperties
+                            | FormOperation::ObserveAllProperties
+                            | FormOperation::UnobserveAllProperties
+                            | FormOperation::SubscribeAllEvents
+                            | FormOperation::UnsubscribeAllEvents
+                            | FormOperation::QueryAllActions => {
+                                Form::try_from_td_form(form, [op].as_slice(), &schema_definitions)
+                                    .map_err(|source| ThingLevelFormError {
+                                        href: form.href.clone(),
+                                        kind: ThingLevelFormErrorKind::InvalidForm { op, source },
+                                    })
+                            }
+
+                            FormOperation::ReadProperty
+                            | FormOperation::WriteProperty
+                            | FormOperation::ObserveProperty
+                            | FormOperation::UnobserveProperty
+                            | FormOperation::InvokeAction
+                            | FormOperation::QueryAction
+                            | FormOperation::CancelAction
+                            | FormOperation::SubscribeEvent
+                            | FormOperation::UnsubscribeEvent => Err(ThingLevelFormError {
+                                href: form.href.clone(),
+                                kind: ThingLevelFormErrorKind::InvalidOp(op),
+                            }),
+                        })
+                    }
+                })
+                .collect::<Result<_, _>>()
+        })
+        .transpose()
+        .map_err(ConsumeError::ThingLevelForm)?
+        .unwrap_or_default();
+
     properties.sort_unstable_by(|a, b| a.name.cmp(&b.name));
     let base = td.base.clone();
     Ok(Consumer {
         base,
         properties,
         client,
+        thing_level_forms,
     })
 }
 
@@ -177,12 +365,31 @@ pub enum ConsumeError {
         href: String,
         source: InvalidForm,
     },
+    ThingLevelForm(ThingLevelFormError),
+}
+
+#[derive(Debug)]
+pub struct ThingLevelFormError {
+    pub href: String,
+    pub kind: ThingLevelFormErrorKind,
+}
+
+#[derive(Debug)]
+pub enum ThingLevelFormErrorKind {
+    InvalidDefault,
+    MultipleOps,
+    InvalidOp(FormOperation),
+    InvalidForm {
+        op: FormOperation,
+        source: InvalidForm,
+    },
 }
 
 #[derive(Debug)]
 pub struct Consumer {
     base: Option<String>,
     properties: Vec<Property>,
+    thing_level_forms: Vec<Form>,
     client: reqwest::Client,
     // TODO: other
 }
@@ -205,6 +412,83 @@ impl Consumer {
                 }
             })
     }
+
+    // TODO: select form based on uri variables
+    pub async fn properties<T>(&self) -> Result<T, PropertiesError>
+    where
+        T: DeserializeOwned,
+    {
+        const EMPTY_DATA_SCHEMA: DataSchema<(), (), ()> = DataSchema {
+            attype: None,
+            title: None,
+            titles: None,
+            constant: None,
+            default: None,
+            description: None,
+            descriptions: None,
+            enumeration: None,
+            format: None,
+            one_of: None,
+            read_only: false,
+            write_only: false,
+            subtype: None,
+            unit: None,
+            other: (),
+        };
+
+        let form = self
+            .thing_level_forms
+            .iter()
+            .find(|form| form.op == [FormOperation::ReadAllProperties])
+            .ok_or(PropertiesError::MissingForm)?;
+
+        // TODO: handle uri variables
+        // TODO: handle security
+        // TODO: create a dataschema for the properties
+        // TODO: validate response
+        create_request_future(
+            form,
+            &self.base,
+            &[],
+            &None,
+            &EMPTY_DATA_SCHEMA,
+            &self.client,
+        )
+        .map_err(|source| PropertiesError::CreateRequest {
+            href: form.href.clone(),
+            source,
+        })?
+        .await
+        .map_err(|source| PropertiesError::Request {
+            href: form.href.clone(),
+            source,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub enum PropertiesError {
+    MissingForm,
+    CreateRequest {
+        href: String,
+        source: CreateRequestFutureError,
+    },
+    Request {
+        href: String,
+        source: PerformRequestError,
+    },
+}
+
+impl Display for PropertiesError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        todo!()
+    }
+}
+
+impl StdError for PropertiesError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        todo!()
+    }
 }
 
 #[derive(Debug)]
@@ -225,17 +509,30 @@ struct Property {
 
 impl<'a> PropertyRef<'a> {
     pub fn read<T>(&self) -> PropertyReader<'a, T> {
-        let inner = PropertyReaderInner {
+        let inner = self.create_inner();
+        PropertyReader {
+            status: PropertyReaderWriterStatus(Ok(inner)),
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn write<T>(&'a self, value: &'a T) -> PropertyWriter<'a, T> {
+        let inner = self.create_inner();
+        PropertyWriter {
+            status: PropertyReaderWriterStatus(Ok(inner)),
+            value,
+        }
+    }
+
+    #[inline]
+    fn create_inner(&self) -> PropertyReaderWriterInner<'a> {
+        PropertyReaderWriterInner {
             property: self.property,
             forms: PartialVecRefs::Whole(&self.property.forms),
             uri_variables: Vec::new(),
             security: None,
             base: self.base,
             client: self.client,
-        };
-        PropertyReader {
-            status: Ok(inner),
-            _marker: PhantomData,
         }
     }
 }
@@ -246,7 +543,7 @@ struct UriVariable {
     schema: ScalarDataSchema,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Form {
     href: String,
     op: Vec<FormOperation>,
@@ -262,7 +559,7 @@ struct Form {
 impl Form {
     fn try_from_td_form<Other>(
         form: &thing::Form<Other>,
-        op: Vec<FormOperation>,
+        op: impl Into<Vec<FormOperation>>,
         schema_definitions: &[SchemaDefinition],
     ) -> Result<Self, InvalidForm>
     where
@@ -313,6 +610,7 @@ impl Form {
             .transpose()?;
         let href = href.clone();
         let method_name = Other::http_protocol_form(other).method_name;
+        let op = op.into();
 
         Ok(Self {
             href,
@@ -403,7 +701,7 @@ impl TryFrom<Option<&[String]>> for SecurityScheme {
 #[derive(Debug)]
 pub struct UnsupportedSecuritySchemeSet(pub Vec<String>);
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AdditionalExpectedResponse {
     success: bool,
     content_type: Option<String>,
@@ -661,35 +959,122 @@ fn data_schema_subtype_without_extensions<DS, AS, OS>(
 
 #[derive(Debug)]
 pub struct PropertyReader<'a, T> {
-    status: Result<PropertyReaderInner<'a>, PropertyReaderError<'a>>,
+    status: PropertyReaderWriterStatus<'a>,
     _marker: PhantomData<fn() -> T>,
 }
 
 impl<'a, T> PropertyReader<'a, T> {
+    #[inline]
     pub fn no_security(&mut self) -> &mut Self {
+        self.status.no_security();
+        self
+    }
+
+    #[inline]
+    pub fn basic(&mut self, username: impl Into<String>, password: impl Into<String>) -> &mut Self {
+        self.status.basic(username, password);
+        self
+    }
+
+    #[inline]
+    pub fn protocol(&mut self, accepted_protocol: Protocol) -> &mut Self {
+        self.status.protocol(accepted_protocol);
+        self
+    }
+
+    #[inline]
+    pub fn protocols(&mut self, accepted_protocols: &[Protocol]) -> &mut Self {
+        self.status.protocols(accepted_protocols);
+        self
+    }
+
+    #[inline]
+    pub fn bearer(&mut self, token: impl Into<String>) -> &mut Self {
+        self.status.bearer(token);
+        self
+    }
+
+    #[inline]
+    pub fn uri_variable<N>(&mut self, name: N, value: UriVariableValue) -> &mut Self
+    where
+        N: Into<String> + AsRef<str>,
+    {
+        self.status.uri_variable(name, value);
+        self
+    }
+
+    pub fn send(
+        &self,
+    ) -> Result<
+        impl Future<Output = Result<T, PerformRequestError>> + '_,
+        PropertyReaderSendError<'_>,
+    >
+    where
+        T: DeserializeOwned,
+    {
+        let PropertyReaderWriterInner {
+            property,
+            base,
+            forms,
+            uri_variables,
+            security,
+            client,
+        } = self
+            .status
+            .0
+            .as_ref()
+            .map_err(|err| PropertyReaderSendError::PropertyReader(err.clone()))?;
+
+        let mut forms = forms
+            .iter()
+            .filter(|form| form.op.contains(&FormOperation::ReadProperty));
+        let form = forms.next().ok_or(PropertyReaderSendError::NoForms)?;
+        if forms.next().is_some() {
+            return Err(PropertyReaderSendError::MultipleChoices);
+        }
+
+        create_request_future(
+            form,
+            base,
+            uri_variables,
+            security,
+            &property.data_schema,
+            client,
+        )
+        .map_err(PropertyReaderSendError::InitFuture)
+    }
+}
+
+#[derive(Debug)]
+pub struct PropertyReaderWriterStatus<'a>(
+    Result<PropertyReaderWriterInner<'a>, PropertyReaderWriterError<'a>>,
+);
+
+impl<'a> PropertyReaderWriterStatus<'a> {
+    pub fn no_security(&mut self) {
         self.filter_security_scheme(StatefulSecurityScheme::NoSecurity)
     }
 
-    pub fn basic(&mut self, username: impl Into<String>, password: impl Into<String>) -> &mut Self {
+    pub fn basic(&mut self, username: impl Into<String>, password: impl Into<String>) {
         let username = username.into();
         let password = password.into();
 
         self.filter_security_scheme(StatefulSecurityScheme::Basic { username, password })
     }
 
-    pub fn bearer(&mut self, token: impl Into<String>) -> &mut Self {
+    pub fn bearer(&mut self, token: impl Into<String>) {
         let token = token.into();
 
         self.filter_security_scheme(StatefulSecurityScheme::Bearer(token))
     }
 
     #[inline]
-    pub fn protocol(&mut self, accepted_protocol: Protocol) -> &mut Self {
+    pub fn protocol(&mut self, accepted_protocol: Protocol) {
         self.protocols([accepted_protocol].as_slice())
     }
 
-    pub fn protocols(&mut self, accepted_protocols: &[Protocol]) -> &mut Self {
-        if let Ok(inner) = &mut self.status {
+    pub fn protocols(&mut self, accepted_protocols: &[Protocol]) {
+        if let Ok(inner) = &mut self.0 {
             let base_protocol = inner
                 .base
                 .as_deref()
@@ -706,23 +1091,22 @@ impl<'a, T> PropertyReader<'a, T> {
             });
 
             if inner.forms.is_empty() {
-                self.status = Err(PropertyReaderError {
+                self.0 = Err(PropertyReaderWriterError {
                     property: inner.property,
-                    kind: PropertyReaderErrorKind::UnavailableProtocols,
+                    kind: PropertyReaderWriterErrorKind::UnavailableProtocols,
                 });
             }
         }
-        self
     }
 
     // TODO: check if we can make `value: impl TryInto<UriVariableValue>`, the type of error could
     // be annyoing because of the `Infallible` conversions.
-    pub fn uri_variable<N>(&mut self, name: N, value: UriVariableValue) -> &mut Self
+    pub fn uri_variable<N>(&mut self, name: N, value: UriVariableValue)
     where
         N: Into<String> + AsRef<str>,
     {
-        let Ok(inner) = &mut self.status else {
-            return self;
+        let Ok(inner) = &mut self.0 else {
+            return;
         };
 
         let name_str = name.as_ref();
@@ -733,79 +1117,38 @@ impl<'a, T> PropertyReader<'a, T> {
             .map(|index| &inner.property.uri_variables[index]);
 
         let Ok(uri_variable) = uri_variable else {
-            self.status = Err(PropertyReaderError {
+            self.0 = Err(PropertyReaderWriterError {
                 property: inner.property,
-                kind: PropertyReaderErrorKind::UnavailableUriVariable(name.into()),
+                kind: PropertyReaderWriterErrorKind::UnavailableUriVariable(name.into()),
             });
-            return self;
+            return;
         };
 
         if let Err(err) = validate_uri_variable_value(&uri_variable.schema, &value) {
-            self.status = Err(PropertyReaderError {
+            self.0 = Err(PropertyReaderWriterError {
                 property: inner.property,
-                kind: PropertyReaderErrorKind::InvalidUriVariable {
+                kind: PropertyReaderWriterErrorKind::InvalidUriVariable {
                     uri_variable: uri_variable.name.clone(),
                     kind: err,
                 },
             });
-            return self;
+            return;
         };
 
         inner.uri_variables.push((name.into(), value));
-        self
     }
 
-    pub fn send(
-        &self,
-    ) -> Result<
-        impl Future<Output = Result<T, PropertyReaderSendFutureError>> + '_,
-        PropertyReaderSendError<'_>,
-    >
-    where
-        T: DeserializeOwned,
-    {
-        let PropertyReaderInner {
-            property,
-            base,
-            forms,
-            uri_variables,
-            security,
-            client,
-        } = self
-            .status
-            .as_ref()
-            .map_err(|err| PropertyReaderSendError::PropertyReader(err.clone()))?;
-
-        let mut forms = forms
-            .iter()
-            .filter(|form| form.op.contains(&FormOperation::ReadProperty));
-        let form = forms.next().ok_or(PropertyReaderSendError::NoForms)?;
-        if forms.next().is_some() {
-            return Err(PropertyReaderSendError::MultipleChoices);
-        }
-
-        create_property_reader_send_future(
-            form,
-            base,
-            uri_variables,
-            security,
-            &property.data_schema,
-            client,
-        )
-        .map_err(PropertyReaderSendError::InitFuture)
-    }
-
-    fn filter_security_scheme(&mut self, security_scheme: StatefulSecurityScheme) -> &mut Self {
-        if let Ok(inner) = &mut self.status {
+    fn filter_security_scheme(&mut self, security_scheme: StatefulSecurityScheme) {
+        if let Ok(inner) = &mut self.0 {
             if inner.security.is_none() {
                 inner
                     .forms
                     .retain(|form| form.security_scheme.contains(security_scheme.to_flag()));
 
                 if inner.forms.is_empty() {
-                    self.status = Err(PropertyReaderError {
+                    self.0 = Err(PropertyReaderWriterError {
                         property: inner.property,
-                        kind: PropertyReaderErrorKind::UnavailableSecurityScheme(
+                        kind: PropertyReaderWriterErrorKind::UnavailableSecurityScheme(
                             security_scheme.to_stateless(),
                         ),
                     });
@@ -813,19 +1156,17 @@ impl<'a, T> PropertyReader<'a, T> {
                     inner.security = Some(security_scheme);
                 }
             } else {
-                self.status = Err(PropertyReaderError {
+                self.0 = Err(PropertyReaderWriterError {
                     property: inner.property,
-                    kind: PropertyReaderErrorKind::SecurityAlreadySet,
+                    kind: PropertyReaderWriterErrorKind::SecurityAlreadySet,
                 });
             }
         }
-
-        self
     }
 }
 
 #[derive(Debug)]
-struct PropertyReaderInner<'a> {
+struct PropertyReaderWriterInner<'a> {
     property: &'a Property,
     base: &'a Option<String>,
     forms: PartialVecRefs<'a, Form>,
@@ -835,7 +1176,7 @@ struct PropertyReaderInner<'a> {
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ReaderSecurityScheme {
+pub enum StatelessSecurityScheme {
     #[default]
     NoSecurity,
     Basic,
@@ -854,11 +1195,11 @@ enum StatefulSecurityScheme {
 }
 
 impl StatefulSecurityScheme {
-    fn to_stateless(&self) -> ReaderSecurityScheme {
+    fn to_stateless(&self) -> StatelessSecurityScheme {
         match self {
-            Self::NoSecurity => ReaderSecurityScheme::Basic,
-            Self::Basic { .. } => ReaderSecurityScheme::Basic,
-            Self::Bearer(_) => ReaderSecurityScheme::Bearer,
+            Self::NoSecurity => StatelessSecurityScheme::Basic,
+            Self::Basic { .. } => StatelessSecurityScheme::Basic,
+            Self::Bearer(_) => StatelessSecurityScheme::Bearer,
         }
     }
 
@@ -964,14 +1305,14 @@ impl<T> ExactSizeIterator for PartialVecRefsIter<'_, T> {
 }
 
 #[derive(Debug, Clone)]
-pub struct PropertyReaderError<'a> {
+pub struct PropertyReaderWriterError<'a> {
     property: &'a Property,
-    pub kind: PropertyReaderErrorKind,
+    pub kind: PropertyReaderWriterErrorKind,
 }
 
 #[derive(Debug, Clone)]
-pub enum PropertyReaderErrorKind {
-    UnavailableSecurityScheme(ReaderSecurityScheme),
+pub enum PropertyReaderWriterErrorKind {
+    UnavailableSecurityScheme(StatelessSecurityScheme),
     UnavailableProtocols,
     SecurityAlreadySet,
     UnavailableUriVariable(String),
@@ -1046,17 +1387,14 @@ impl FromStr for Protocol {
     }
 }
 
-fn create_property_reader_send_future<'a, T>(
+fn create_request_future<'a, T>(
     form: &Form,
     base: &Option<String>,
     uri_variables: &[(String, UriVariableValue)],
     security: &'a Option<StatefulSecurityScheme>,
     data_schema: &'a DataSchema<(), (), ()>,
     client: &reqwest::Client,
-) -> Result<
-    impl Future<Output = Result<T, PropertyReaderSendFutureError>> + 'a,
-    PropertyReaderSendFutureInitError,
->
+) -> Result<impl Future<Output = Result<T, PerformRequestError>> + 'a, CreateRequestFutureError>
 where
     T: DeserializeOwned + 'a,
 {
@@ -1066,28 +1404,25 @@ where
         .or_else(|err| match err {
             url::ParseError::RelativeUrlWithoutBase => base
                 .as_ref()
-                .ok_or_else(|| {
-                    PropertyReaderSendFutureInitError::RelativeUrlWithoutBase(form.href.clone())
-                })
+                .ok_or_else(|| CreateRequestFutureError::RelativeUrlWithoutBase(form.href.clone()))
                 .and_then(|base| {
-                    base.parse::<Url>().map_err(|source| {
-                        PropertyReaderSendFutureInitError::InvalidBase {
+                    base.parse::<Url>()
+                        .map_err(|source| CreateRequestFutureError::InvalidBase {
                             base: base.to_string(),
                             href: form.href.clone(),
                             source,
-                        }
-                    })
+                        })
                 })
                 .and_then(|base| {
                     base.join(&form.href).map_err(|source| {
-                        PropertyReaderSendFutureInitError::InvalidJoinedHref {
+                        CreateRequestFutureError::InvalidJoinedHref {
                             base,
                             href: form.href.clone(),
                             source,
                         }
                     })
                 }),
-            _ => Err(PropertyReaderSendFutureInitError::InvalidHref {
+            _ => Err(CreateRequestFutureError::InvalidHref {
                 href: form.href.clone(),
                 source: err,
             }),
@@ -1135,8 +1470,8 @@ where
             Ok(perform_request(builder, handle_json_response, data_schema))
         }
         None => Ok(perform_request(builder, handle_json_response, data_schema)),
-        Some(content_type) => Err(PropertyReaderSendFutureInitError::InvalidResponse(
-            PropertyReaderSendFutureInvalidResponse::UnsupportedFormat(content_type.clone()),
+        Some(content_type) => Err(CreateRequestFutureError::InvalidResponse(
+            PerformRequestInvalidResponse::UnsupportedFormat(content_type.clone()),
         )),
     }
 }
@@ -1145,33 +1480,33 @@ async fn perform_request<'a, T, F, Fut>(
     builder: reqwest::RequestBuilder,
     response_handler: F,
     data_schema: &'a DataSchema<(), (), ()>,
-) -> Result<T, PropertyReaderSendFutureError>
+) -> Result<T, PerformRequestError>
 where
     F: 'a + FnOnce(reqwest::Response, &'a DataSchema<(), (), ()>) -> Fut,
-    Fut: 'a + Future<Output = Result<T, PropertyReaderSendFutureInvalidResponse>>,
+    Fut: 'a + Future<Output = Result<T, PerformRequestInvalidResponse>>,
 {
     let response = builder
         .send()
         .await
-        .map_err(PropertyReaderSendFutureError::RequestError)?
+        .map_err(PerformRequestError::RequestError)?
         .error_for_status()
-        .map_err(PropertyReaderSendFutureError::ResponseError)?;
+        .map_err(PerformRequestError::ResponseError)?;
 
     response_handler(response, data_schema)
         .await
-        .map_err(PropertyReaderSendFutureError::InvalidResponse)
+        .map_err(PerformRequestError::InvalidResponse)
 }
 
 #[derive(Debug)]
 pub enum PropertyReaderSendError<'a> {
-    PropertyReader(PropertyReaderError<'a>),
+    PropertyReader(PropertyReaderWriterError<'a>),
     MultipleChoices,
     NoForms,
-    InitFuture(PropertyReaderSendFutureInitError),
+    InitFuture(CreateRequestFutureError),
 }
 
 #[derive(Debug)]
-pub enum PropertyReaderSendFutureInitError {
+pub enum CreateRequestFutureError {
     InvalidHref {
         href: String,
         source: url::ParseError,
@@ -1187,18 +1522,18 @@ pub enum PropertyReaderSendFutureInitError {
         href: String,
         source: url::ParseError,
     },
-    InvalidResponse(PropertyReaderSendFutureInvalidResponse),
+    InvalidResponse(PerformRequestInvalidResponse),
 }
 
 #[derive(Debug)]
-pub enum PropertyReaderSendFutureError {
-    InvalidResponse(PropertyReaderSendFutureInvalidResponse),
+pub enum PerformRequestError {
+    InvalidResponse(PerformRequestInvalidResponse),
     RequestError(reqwest::Error),
     ResponseError(reqwest::Error),
 }
 
 #[derive(Debug)]
-pub enum PropertyReaderSendFutureInvalidResponse {
+pub enum PerformRequestInvalidResponse {
     Json(HandleJsonResponseError),
     UnsupportedFormat(String),
 }
@@ -1207,13 +1542,13 @@ pub enum PropertyReaderSendFutureInvalidResponse {
 async fn handle_json_response<T>(
     response: reqwest::Response,
     data_schema: &DataSchema<(), (), ()>,
-) -> Result<T, PropertyReaderSendFutureInvalidResponse>
+) -> Result<T, PerformRequestInvalidResponse>
 where
     T: DeserializeOwned,
 {
     handle_json_response_inner(response, data_schema)
         .await
-        .map_err(PropertyReaderSendFutureInvalidResponse::Json)
+        .map_err(PerformRequestInvalidResponse::Json)
 }
 
 async fn handle_json_response_inner<T>(
@@ -2128,6 +2463,53 @@ fn get_integral_from_number(number: &serde_json::Number) -> Option<i64> {
         (value.fract().abs() < f64::EPSILON).then_some(value as i64)
     } else {
         None
+    }
+}
+
+#[derive(Debug)]
+pub struct PropertyWriter<'a, T> {
+    status: PropertyReaderWriterStatus<'a>,
+    value: &'a T,
+}
+
+impl<'a, T> PropertyWriter<'a, T> {
+    #[inline]
+    pub fn no_security(&mut self) -> &mut Self {
+        self.status.no_security();
+        self
+    }
+
+    #[inline]
+    pub fn basic(&mut self, username: impl Into<String>, password: impl Into<String>) -> &mut Self {
+        self.status.basic(username, password);
+        self
+    }
+
+    #[inline]
+    pub fn protocol(&mut self, accepted_protocol: Protocol) -> &mut Self {
+        self.status.protocol(accepted_protocol);
+        self
+    }
+
+    #[inline]
+    pub fn protocols(&mut self, accepted_protocols: &[Protocol]) -> &mut Self {
+        self.status.protocols(accepted_protocols);
+        self
+    }
+
+    #[inline]
+    pub fn bearer(&mut self, token: impl Into<String>) -> &mut Self {
+        self.status.bearer(token);
+        self
+    }
+
+    #[inline]
+    pub fn uri_variable<N>(&mut self, name: N, value: UriVariableValue) -> &mut Self
+    where
+        N: Into<String> + AsRef<str>,
+    {
+        self.status.uri_variable(name, value);
+        self
     }
 }
 
