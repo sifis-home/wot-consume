@@ -7,7 +7,7 @@ mod json;
 mod sealed;
 
 use std::{
-    convert::identity,
+    convert::{self, identity},
     error::Error as StdError,
     fmt::{self, Display},
     future::Future,
@@ -22,7 +22,7 @@ use std::{
 use bitflags::bitflags;
 use json::ValueRef;
 use regex::Regex;
-use reqwest::Url;
+use reqwest::{RequestBuilder, StatusCode, Url};
 use sealed::HasHttpProtocolExtension;
 use serde::de::DeserializeOwned;
 use smallvec::{smallvec, SmallVec};
@@ -289,12 +289,10 @@ where
             forms
                 .iter()
                 .filter_map(|form| match &form.op {
-                    DefaultedFormOperations::Default => {
-                        return Some(Err(ThingLevelFormError {
-                            href: form.href.clone(),
-                            kind: ThingLevelFormErrorKind::InvalidDefault,
-                        }))
-                    }
+                    DefaultedFormOperations::Default => Some(Err(ThingLevelFormError {
+                        href: form.href.clone(),
+                        kind: ThingLevelFormErrorKind::InvalidDefault,
+                    })),
                     DefaultedFormOperations::Custom(ops) => {
                         let (&op, ops) = ops.split_first()?;
 
@@ -451,7 +449,9 @@ impl Consumer {
             &self.base,
             &[],
             &None,
-            &EMPTY_DATA_SCHEMA,
+            convert::identity,
+            make_expected_status_fn(StatusCode::OK),
+            handle_json_response_no_validation,
             &self.client,
         )
         .map_err(|source| PropertiesError::CreateRequest {
@@ -463,6 +463,18 @@ impl Consumer {
             href: form.href.clone(),
             source,
         })
+    }
+}
+
+fn make_expected_status_fn(
+    expected: StatusCode,
+) -> impl FnOnce(StatusCode) -> Result<(), StatusCode> {
+    move |found: StatusCode| {
+        if found == expected {
+            Ok(())
+        } else {
+            Err(expected)
+        }
     }
 }
 
@@ -518,6 +530,7 @@ impl<'a> PropertyRef<'a> {
 
     pub fn write<T>(&'a self, value: &'a T) -> PropertyWriter<'a, T> {
         let inner = self.create_inner();
+        // TODO: validate schema for `value`
         PropertyWriter {
             status: PropertyReaderWriterStatus(Ok(inner)),
             value,
@@ -1007,7 +1020,7 @@ impl<'a, T> PropertyReader<'a, T> {
         &self,
     ) -> Result<
         impl Future<Output = Result<T, PerformRequestError>> + '_,
-        PropertyReaderSendError<'_>,
+        PropertyReaderWriterSendError<'_>,
     >
     where
         T: DeserializeOwned,
@@ -1023,14 +1036,14 @@ impl<'a, T> PropertyReader<'a, T> {
             .status
             .0
             .as_ref()
-            .map_err(|err| PropertyReaderSendError::PropertyReader(err.clone()))?;
+            .map_err(|err| PropertyReaderWriterSendError::PropertyReaderWriter(err.clone()))?;
 
         let mut forms = forms
             .iter()
             .filter(|form| form.op.contains(&FormOperation::ReadProperty));
-        let form = forms.next().ok_or(PropertyReaderSendError::NoForms)?;
+        let form = forms.next().ok_or(PropertyReaderWriterSendError::NoForms)?;
         if forms.next().is_some() {
-            return Err(PropertyReaderSendError::MultipleChoices);
+            return Err(PropertyReaderWriterSendError::MultipleChoices);
         }
 
         create_request_future(
@@ -1038,10 +1051,12 @@ impl<'a, T> PropertyReader<'a, T> {
             base,
             uri_variables,
             security,
-            &property.data_schema,
+            convert::identity,
+            make_expected_status_fn(StatusCode::OK),
+            |response| handle_json_response(response, &property.data_schema),
             client,
         )
-        .map_err(PropertyReaderSendError::InitFuture)
+        .map_err(PropertyReaderWriterSendError::InitFuture)
     }
 }
 
@@ -1387,16 +1402,22 @@ impl FromStr for Protocol {
     }
 }
 
-fn create_request_future<'a, T>(
+fn create_request_future<'a, T, F, G, H, Fut>(
     form: &Form,
     base: &Option<String>,
     uri_variables: &[(String, UriVariableValue)],
     security: &'a Option<StatefulSecurityScheme>,
-    data_schema: &'a DataSchema<(), (), ()>,
+    handle_request_builder: F,
+    check_status: G,
+    response_handler: H,
     client: &reqwest::Client,
 ) -> Result<impl Future<Output = Result<T, PerformRequestError>> + 'a, CreateRequestFutureError>
 where
     T: DeserializeOwned + 'a,
+    F: FnOnce(RequestBuilder) -> RequestBuilder,
+    G: FnOnce(StatusCode) -> Result<(), StatusCode> + 'a,
+    H: FnOnce(reqwest::Response) -> Fut + 'a,
+    Fut: 'a + Future<Output = Result<T, PerformRequestInvalidResponse>>,
 {
     let url = form
         .href
@@ -1463,27 +1484,36 @@ where
         Some(StatefulSecurityScheme::Bearer(token)) => builder.bearer_auth(token),
     };
 
+    let perform_json_request = || {
+        Ok(perform_request(
+            handle_request_builder(builder),
+            check_status,
+            response_handler,
+        ))
+    };
+
     // FIXME: unify the two condition in order to store (at least try to) an impl Future
     // instead of a pin-boxed dyn Future
     match &form.content_type {
         Some(content_type) if content_type.eq_ignore_ascii_case("application/json") => {
-            Ok(perform_request(builder, handle_json_response, data_schema))
+            perform_json_request()
         }
-        None => Ok(perform_request(builder, handle_json_response, data_schema)),
+        None => perform_json_request(),
         Some(content_type) => Err(CreateRequestFutureError::InvalidResponse(
             PerformRequestInvalidResponse::UnsupportedFormat(content_type.clone()),
         )),
     }
 }
 
-async fn perform_request<'a, T, F, Fut>(
+async fn perform_request<T, F, G, Fut>(
     builder: reqwest::RequestBuilder,
-    response_handler: F,
-    data_schema: &'a DataSchema<(), (), ()>,
+    check_status: F,
+    response_handler: G,
 ) -> Result<T, PerformRequestError>
 where
-    F: 'a + FnOnce(reqwest::Response, &'a DataSchema<(), (), ()>) -> Fut,
-    Fut: 'a + Future<Output = Result<T, PerformRequestInvalidResponse>>,
+    F: FnOnce(StatusCode) -> Result<(), StatusCode>,
+    G: FnOnce(reqwest::Response) -> Fut,
+    Fut: Future<Output = Result<T, PerformRequestInvalidResponse>>,
 {
     let response = builder
         .send()
@@ -1492,14 +1522,19 @@ where
         .error_for_status()
         .map_err(PerformRequestError::ResponseError)?;
 
-    response_handler(response, data_schema)
+    check_status(response.status()).map_err(|expected| PerformRequestError::InvalidStatus {
+        expected,
+        found: response.status(),
+    })?;
+
+    response_handler(response)
         .await
         .map_err(PerformRequestError::InvalidResponse)
 }
 
 #[derive(Debug)]
-pub enum PropertyReaderSendError<'a> {
-    PropertyReader(PropertyReaderWriterError<'a>),
+pub enum PropertyReaderWriterSendError<'a> {
+    PropertyReaderWriter(PropertyReaderWriterError<'a>),
     MultipleChoices,
     NoForms,
     InitFuture(CreateRequestFutureError),
@@ -1528,6 +1563,10 @@ pub enum CreateRequestFutureError {
 #[derive(Debug)]
 pub enum PerformRequestError {
     InvalidResponse(PerformRequestInvalidResponse),
+    InvalidStatus {
+        expected: StatusCode,
+        found: StatusCode,
+    },
     RequestError(reqwest::Error),
     ResponseError(reqwest::Error),
 }
@@ -1536,6 +1575,18 @@ pub enum PerformRequestError {
 pub enum PerformRequestInvalidResponse {
     Json(HandleJsonResponseError),
     UnsupportedFormat(String),
+}
+
+#[inline]
+async fn handle_json_response_no_validation<T>(
+    response: reqwest::Response,
+) -> Result<T, PerformRequestInvalidResponse>
+where
+    T: DeserializeOwned,
+{
+    response.json().await.map_err(|source| {
+        PerformRequestInvalidResponse::Json(HandleJsonResponseError::Json(source))
+    })
 }
 
 #[inline]
@@ -2510,6 +2561,49 @@ impl<'a, T> PropertyWriter<'a, T> {
     {
         self.status.uri_variable(name, value);
         self
+    }
+
+    pub fn send(
+        &self,
+    ) -> Result<
+        impl Future<Output = Result<(), PerformRequestError>> + '_,
+        PropertyReaderWriterSendError<'_>,
+    >
+    where
+        for<'b> &'b T: Into<reqwest::Body>,
+    {
+        let PropertyReaderWriterInner {
+            property: _,
+            base,
+            forms,
+            uri_variables,
+            security,
+            client,
+        } = self
+            .status
+            .0
+            .as_ref()
+            .map_err(|err| PropertyReaderWriterSendError::PropertyReaderWriter(err.clone()))?;
+
+        let mut forms = forms
+            .iter()
+            .filter(|form| form.op.contains(&FormOperation::WriteProperty));
+        let form = forms.next().ok_or(PropertyReaderWriterSendError::NoForms)?;
+        if forms.next().is_some() {
+            return Err(PropertyReaderWriterSendError::MultipleChoices);
+        }
+
+        create_request_future(
+            form,
+            base,
+            uri_variables,
+            security,
+            |builder| builder.body(self.value),
+            make_expected_status_fn(StatusCode::NO_CONTENT),
+            handle_json_response_no_validation::<()>,
+            client,
+        )
+        .map_err(PropertyReaderWriterSendError::InitFuture)
     }
 }
 
