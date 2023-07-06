@@ -24,11 +24,13 @@ use json::ValueRef;
 use regex::Regex;
 use reqwest::{RequestBuilder, StatusCode, Url};
 use sealed::HasHttpProtocolExtension;
-use serde::de::DeserializeOwned;
+use serde::{de::DeserializeOwned, Serialize};
 use smallvec::{smallvec, SmallVec};
 use tracing::warn;
+pub use wot_td;
 use wot_td::{
     extend::ExtendableThing,
+    hlist,
     protocol::http,
     thing::{
         self, ArraySchema, BoxedElemOrVec, DataSchema, DataSchemaSubtype, DefaultedFormOperations,
@@ -39,11 +41,11 @@ use wot_td::{
 };
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-pub async fn get_thing_description(
+pub async fn get_thing_description<Other: ExtendableThing + DeserializeOwned>(
     client: &reqwest::Client,
     host: &str,
     port: Option<u16>,
-) -> Result<Thing, GetThingDescriptionError> {
+) -> Result<Thing<Other>, GetThingDescriptionError> {
     macro_rules! err {
         ($kind:expr) => {
             GetThingDescriptionError {
@@ -269,6 +271,7 @@ where
                         .collect::<Result<Vec<_>, _>>()?;
 
                     let data_schema = data_schema_without_extensions(data_schema);
+                    let attype = attype.clone().unwrap_or_default();
 
                     Ok(Property {
                         name: property_name.clone(),
@@ -276,6 +279,7 @@ where
                         forms,
                         uri_variables,
                         data_schema,
+                        attype,
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()
@@ -366,6 +370,36 @@ pub enum ConsumeError {
     ThingLevelForm(ThingLevelFormError),
 }
 
+impl Display for ConsumeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("cannot consume thing, ")?;
+        match self {
+            ConsumeError::UriVariable { property, name, .. } => write!(
+                f,
+                r#"URI variable "{name}" on property "{property}" is not an accepted scalar type"#
+            ),
+            ConsumeError::Form { property, href, .. } => write!(
+                f,
+                r#"form for property "{property}" pointing to "{href}" cannot be converted into \
+                an usable form"#
+            ),
+            ConsumeError::ThingLevelForm(_) => {
+                f.write_str("unable to convert thing-level forms into usable forms")
+            }
+        }
+    }
+}
+
+impl StdError for ConsumeError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            ConsumeError::UriVariable { source, .. } => Some(source),
+            ConsumeError::Form { source, .. } => Some(source),
+            ConsumeError::ThingLevelForm(source) => Some(source),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ThingLevelFormError {
     pub href: String,
@@ -381,6 +415,18 @@ pub enum ThingLevelFormErrorKind {
         op: FormOperation,
         source: InvalidForm,
     },
+}
+
+impl Display for ThingLevelFormError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        todo!()
+    }
+}
+
+impl StdError for ThingLevelFormError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        todo!()
+    }
 }
 
 #[derive(Debug)]
@@ -400,6 +446,26 @@ impl Consumer {
             .ok()
             .map(|index| {
                 let property = &self.properties[index];
+                let base = &self.base;
+                let client = &self.client;
+
+                PropertyRef {
+                    property,
+                    base,
+                    client,
+                }
+            })
+    }
+
+    #[inline]
+    pub fn property_by<F>(&self, mut f: F) -> Option<PropertyRef<'_>>
+    where
+        F: FnMut(&Property) -> bool,
+    {
+        self.properties
+            .iter()
+            .find(|&property| f(property))
+            .map(|property| {
                 let base = &self.base;
                 let client = &self.client;
 
@@ -448,7 +514,7 @@ impl Consumer {
             form,
             &self.base,
             &[],
-            &None,
+            None,
             convert::identity,
             make_expected_status_fn(StatusCode::OK),
             handle_json_response_no_validation,
@@ -511,12 +577,35 @@ pub struct PropertyRef<'a> {
 }
 
 #[derive(Debug)]
-struct Property {
+pub struct Property {
     name: String,
     observable: bool,
     forms: Vec<Form>,
     uri_variables: Vec<UriVariable>,
     data_schema: DataSchema<(), (), ()>,
+    attype: Vec<String>,
+}
+
+impl Property {
+    #[inline]
+    pub fn name(&self) -> &str {
+        self.name.as_ref()
+    }
+
+    #[inline]
+    pub fn observable(&self) -> bool {
+        self.observable
+    }
+
+    #[inline]
+    pub fn attype(&self) -> &[String] {
+        self.attype.as_ref()
+    }
+
+    #[inline]
+    pub fn data_schema(&self) -> &DataSchema<(), (), ()> {
+        &self.data_schema
+    }
 }
 
 impl<'a> PropertyRef<'a> {
@@ -528,13 +617,38 @@ impl<'a> PropertyRef<'a> {
         }
     }
 
-    pub fn write<T>(&'a self, value: &'a T) -> PropertyWriter<'a, T> {
+    pub fn write<T: 'a>(&'a self, value: T) -> PropertyWriter<'a, T> {
         let inner = self.create_inner();
         // TODO: validate schema for `value`
         PropertyWriter {
             status: PropertyReaderWriterStatus(Ok(inner)),
             value,
         }
+    }
+
+    #[inline]
+    pub fn write_json<'t, T>(
+        &'a self,
+        value: &'t T,
+    ) -> Result<PropertyWriter<'a, Vec<u8>>, PropertyWriterJsonError<'t, T>>
+    where
+        T: Serialize,
+    {
+        self.write_json_with_buffer(value, Vec::new())
+    }
+
+    pub fn write_json_with_buffer<'t, T, W>(
+        &'a self,
+        value: &'t T,
+        mut buffer: W,
+    ) -> Result<PropertyWriter<'a, W>, PropertyWriterJsonError<'t, T>>
+    where
+        T: ?Sized + Serialize,
+        W: 'a + std::io::Write + Into<reqwest::Body>,
+    {
+        serde_json::to_writer(&mut buffer, value)
+            .map_err(|source| PropertyWriterJsonError { value, source })?;
+        Ok(self.write(buffer))
     }
 
     #[inline]
@@ -551,13 +665,19 @@ impl<'a> PropertyRef<'a> {
 }
 
 #[derive(Debug)]
+pub struct PropertyWriterJsonError<'a, T: ?Sized> {
+    pub value: &'a T,
+    pub source: serde_json::Error,
+}
+
+#[derive(Debug)]
 struct UriVariable {
     name: String,
     schema: ScalarDataSchema,
 }
 
 #[derive(Debug, Clone)]
-struct Form {
+pub struct Form {
     href: String,
     op: Vec<FormOperation>,
     content_type: Option<String>,
@@ -637,6 +757,51 @@ impl Form {
             method_name,
         })
     }
+
+    #[inline]
+    pub fn href(&self) -> &str {
+        self.href.as_ref()
+    }
+
+    #[inline]
+    pub fn op(&self) -> &[FormOperation] {
+        self.op.as_ref()
+    }
+
+    #[inline]
+    pub fn content_type(&self) -> Option<&String> {
+        self.content_type.as_ref()
+    }
+
+    #[inline]
+    pub fn content_coding(&self) -> Option<&String> {
+        self.content_coding.as_ref()
+    }
+
+    #[inline]
+    pub fn subprotocol(&self) -> Option<Subprotocol> {
+        self.subprotocol
+    }
+
+    #[inline]
+    pub fn security_scheme(&self) -> SecurityScheme {
+        self.security_scheme
+    }
+
+    #[inline]
+    pub fn expected_response_content_type(&self) -> Option<&String> {
+        self.expected_response_content_type.as_ref()
+    }
+
+    #[inline]
+    pub fn additional_expected_response(&self) -> Option<&Vec<AdditionalExpectedResponse, Global>> {
+        self.additional_expected_response.as_ref()
+    }
+
+    #[inline]
+    pub fn method_name(&self) -> Option<Method> {
+        self.method_name
+    }
 }
 
 #[derive(Debug)]
@@ -645,6 +810,18 @@ pub enum InvalidForm {
     UnsupportedSubprotocol(UnsupportedSubprotocol),
     UnsupportedSecurity(UnsupportedSecuritySchemeSet),
     MissingSchemaDefinition(MissingSchemaDefinition),
+}
+
+impl Display for InvalidForm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        todo!()
+    }
+}
+
+impl StdError for InvalidForm {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        todo!()
+    }
 }
 
 /// A fixed set of supported protocols.
@@ -823,6 +1000,14 @@ impl<DS, AS, OS> TryFrom<&DataSchema<DS, AS, OS>> for ScalarDataSchema {
 #[derive(Debug)]
 pub struct NonScalarDataSchema;
 
+impl Display for NonScalarDataSchema {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        todo!()
+    }
+}
+
+impl StdError for NonScalarDataSchema {}
+
 #[derive(Debug)]
 enum ScalarDataSchemaSubtype {
     Boolean,
@@ -976,7 +1161,7 @@ pub struct PropertyReader<'a, T> {
     _marker: PhantomData<fn() -> T>,
 }
 
-impl<'a, T> PropertyReader<'a, T> {
+impl<'a, T: 'static> PropertyReader<'a, T> {
     #[inline]
     pub fn no_security(&mut self) -> &mut Self {
         self.status.no_security();
@@ -1019,8 +1204,8 @@ impl<'a, T> PropertyReader<'a, T> {
     pub fn send(
         &self,
     ) -> Result<
-        impl Future<Output = Result<T, PerformRequestError>> + '_,
-        PropertyReaderWriterSendError<'_>,
+        impl Future<Output = Result<T, PerformRequestError>> + 'a,
+        PropertyReaderWriterSendError<'a>,
     >
     where
         T: DeserializeOwned,
@@ -1050,7 +1235,7 @@ impl<'a, T> PropertyReader<'a, T> {
             form,
             base,
             uri_variables,
-            security,
+            security.as_ref(),
             convert::identity,
             make_expected_status_fn(StatusCode::OK),
             |response| handle_json_response(response, &property.data_schema),
@@ -1406,7 +1591,7 @@ fn create_request_future<'a, T, F, G, H, Fut>(
     form: &Form,
     base: &Option<String>,
     uri_variables: &[(String, UriVariableValue)],
-    security: &'a Option<StatefulSecurityScheme>,
+    security: Option<&StatefulSecurityScheme>,
     handle_request_builder: F,
     check_status: G,
     response_handler: H,
@@ -1476,7 +1661,7 @@ where
     });
 
     let builder = client.request(method, url);
-    let builder = match security {
+    let builder = match &security {
         None | Some(StatefulSecurityScheme::NoSecurity) => builder,
         Some(StatefulSecurityScheme::Basic { username, password }) => {
             builder.basic_auth(username, Some(password))
@@ -2520,7 +2705,7 @@ fn get_integral_from_number(number: &serde_json::Number) -> Option<i64> {
 #[derive(Debug)]
 pub struct PropertyWriter<'a, T> {
     status: PropertyReaderWriterStatus<'a>,
-    value: &'a T,
+    value: T,
 }
 
 impl<'a, T> PropertyWriter<'a, T> {
@@ -2564,13 +2749,13 @@ impl<'a, T> PropertyWriter<'a, T> {
     }
 
     pub fn send(
-        &self,
+        self,
     ) -> Result<
-        impl Future<Output = Result<(), PerformRequestError>> + '_,
-        PropertyReaderWriterSendError<'_>,
+        impl Future<Output = Result<(), PerformRequestError>> + 'a,
+        PropertyReaderWriterSendError<'a>,
     >
     where
-        for<'b> &'b T: Into<reqwest::Body>,
+        T: Into<reqwest::Body>,
     {
         let PropertyReaderWriterInner {
             property: _,
@@ -2582,7 +2767,6 @@ impl<'a, T> PropertyWriter<'a, T> {
         } = self
             .status
             .0
-            .as_ref()
             .map_err(|err| PropertyReaderWriterSendError::PropertyReaderWriter(err.clone()))?;
 
         let mut forms = forms
@@ -2596,8 +2780,8 @@ impl<'a, T> PropertyWriter<'a, T> {
         create_request_future(
             form,
             base,
-            uri_variables,
-            security,
+            &uri_variables,
+            security.as_ref(),
             |builder| builder.body(self.value),
             make_expected_status_fn(StatusCode::NO_CONTENT),
             handle_json_response_no_validation::<()>,
